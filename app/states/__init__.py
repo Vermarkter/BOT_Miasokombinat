@@ -1,4 +1,4 @@
 from app.states.auth import AuthStates
-from app.states.order import OrderForm
+from app.states.order import OrderStates
 
-__all__ = ["AuthStates", "OrderForm"]
+__all__ = ["AuthStates", "OrderStates"]
