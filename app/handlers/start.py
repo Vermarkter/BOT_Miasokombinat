@@ -9,6 +9,7 @@ from app.database import auth_storage
 from app.keyboards import build_main_keyboard, build_request_contact_keyboard
 from app.services import OneCService, OneCServiceError
 from app.states import AuthStates
+from app.utils import is_valid_phone, normalize_phone
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -95,12 +96,21 @@ async def receive_code_handler(message: Message, state: FSMContext) -> None:
         return
 
     state_data = await state.get_data()
-    phone = str(state_data.get("phone", "")).strip()
+    phone = normalize_phone(str(state_data.get("phone", "")).strip())
     if not phone:
         logger.warning("Phone not found in FSM data while waiting_for_code: user_id=%s", user_id)
         await state.set_state(AuthStates.waiting_for_phone)
         await message.answer(
             "Не знайдено номер телефону. Надішліть контакт ще раз.",
+            reply_markup=build_request_contact_keyboard(),
+        )
+        return
+    if not is_valid_phone(phone):
+        logger.warning("Invalid phone format before auth request: user_id=%s phone=%s", user_id, _mask_phone(phone))
+        await state.set_state(AuthStates.waiting_for_phone)
+        await state.update_data(phone=None)
+        await message.answer(
+            "Схоже, номер телефону вказано некоректно. Надішліть свій номер ще раз кнопкою нижче.",
             reply_markup=build_request_contact_keyboard(),
         )
         return
@@ -112,9 +122,9 @@ async def receive_code_handler(message: Message, state: FSMContext) -> None:
     )
     try:
         is_authorized = await one_c_service.check_auth(phone=phone, code=code)
-    except OneCServiceError as exc:
+    except OneCServiceError:
         logger.exception("Authorization check failed due to 1C error: user_id=%s", user_id)
-        await message.answer(f"Помилка зв'язку з 1С: {exc}")
+        await message.answer("Не вдалося виконати перевірку зараз. Спробуйте ще раз трохи пізніше.")
         return
 
     if is_authorized:

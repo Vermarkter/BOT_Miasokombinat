@@ -8,6 +8,7 @@ import aiohttp
 from config import get_settings
 
 logger = logging.getLogger(__name__)
+fail_logger = logging.getLogger("one_c_http_failures")
 
 
 class OneCServiceError(Exception):
@@ -70,14 +71,32 @@ class OneCService:
                             return await response.json(content_type=None)
                         except aiohttp.ContentTypeError:
                             logger.error("1C response is not JSON: endpoint=%s body=%s", endpoint, raw_body)
+                            fail_logger.error(
+                                "HTTP failure | endpoint=%s method=%s status=200 invalid_json body=%s",
+                                endpoint,
+                                method,
+                                raw_body,
+                            )
                             raise OneCServiceError("1C повернула невалідний JSON.")
 
                     if response.status == 401:
                         logger.error("1C returned 401 Unauthorized for endpoint=%s", endpoint)
+                        fail_logger.error(
+                            "HTTP failure | endpoint=%s method=%s status=401 body=%s",
+                            endpoint,
+                            method,
+                            raw_body,
+                        )
                         raise OneCServiceError("Помилка авторизації в 1С (401).")
 
                     if response.status == 500:
                         logger.error("1C returned 500 Server Error for endpoint=%s body=%s", endpoint, raw_body)
+                        fail_logger.error(
+                            "HTTP failure | endpoint=%s method=%s status=500 body=%s",
+                            endpoint,
+                            method,
+                            raw_body,
+                        )
                         raise OneCServiceError("Внутрішня помилка сервера 1С (500).")
 
                     logger.error(
@@ -86,12 +105,21 @@ class OneCService:
                         response.status,
                         raw_body,
                     )
+                    fail_logger.error(
+                        "HTTP failure | endpoint=%s method=%s status=%s body=%s",
+                        endpoint,
+                        method,
+                        response.status,
+                        raw_body,
+                    )
                     raise OneCServiceError(f"Неочікуваний HTTP-статус 1С: {response.status}.")
         except asyncio.TimeoutError as exc:
             logger.exception("1C request timeout: endpoint=%s", endpoint)
+            fail_logger.error("HTTP failure | endpoint=%s method=%s timeout", endpoint, method)
             raise OneCServiceError("Таймаут з'єднання з 1С.") from exc
         except aiohttp.ClientError as exc:
             logger.exception("1C request failed: endpoint=%s", endpoint)
+            fail_logger.error("HTTP failure | endpoint=%s method=%s client_error=%s", endpoint, method, str(exc))
             raise OneCServiceError("1С недоступна або помилка мережі.") from exc
 
     async def check_auth(self, phone: str, code: str) -> bool:
@@ -178,3 +206,34 @@ class OneCService:
         if not order_number:
             raise OneCServiceError("1C не повернула номер замовлення.")
         return {"status": "success", "order_number": order_number}
+
+    async def check_base_url_status(self) -> tuple[bool, str]:
+        url = self._build_url("")
+        timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.head(url, allow_redirects=True) as response:
+                    status = response.status
+                    if status in (405, 501):
+                        async with session.get(url, allow_redirects=True) as get_response:
+                            status = get_response.status
+        except asyncio.TimeoutError:
+            fail_logger.error("HTTP failure | endpoint=%s method=HEAD timeout", url)
+            return False, "Сервіс замовлень не відповідає. Спробуйте трохи пізніше."
+        except aiohttp.ClientError as exc:
+            fail_logger.error("HTTP failure | endpoint=%s method=HEAD client_error=%s", url, str(exc))
+            return False, "Немає зв'язку із сервером замовлень."
+
+        if status == 200:
+            return True, "Сервіс замовлень працює."
+        if status == 401:
+            return True, "Сервіс замовлень доступний, але потрібна авторизація."
+        if status >= 500:
+            fail_logger.error("HTTP failure | endpoint=%s method=HEAD status=%s", url, status)
+            return False, "Сервіс замовлень тимчасово перевантажений."
+
+        if status >= 400:
+            return True, f"Сервіс відповідає (код {status})."
+
+        return True, f"Сервіс працює (код {status})."

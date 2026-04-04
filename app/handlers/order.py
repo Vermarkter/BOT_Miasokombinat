@@ -116,6 +116,10 @@ def _is_authorized(message: Message) -> bool:
     return auth_storage.get_user_authorization(message.from_user.id) == "Authorized"
 
 
+def _service_unavailable_message() -> str:
+    return "?????? ????????? ????????? ???????????. ????????? ?? ??? ????? ???????."
+
+
 @router.message(Command("order"))
 @router.message(F.text == NEW_ORDER_BUTTON_TEXT)
 async def start_order_handler(message: Message, state: FSMContext) -> None:
@@ -129,9 +133,9 @@ async def start_order_handler(message: Message, state: FSMContext) -> None:
 
     try:
         clients = await one_c_service.get_clients()
-    except OneCServiceError as exc:
+    except OneCServiceError:
         logger.exception("Failed to fetch clients: user_id=%s", user_id)
-        await message.answer(f"Помилка отримання клієнтів з 1С: {exc}")
+        await message.answer(_service_unavailable_message())
         return
 
     if not clients:
@@ -171,9 +175,9 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
     if not isinstance(clients, list):
         try:
             clients = [client.name for client in await one_c_service.get_clients()]
-        except OneCServiceError as exc:
+        except OneCServiceError:
             logger.exception("Failed to refresh clients: user_id=%s", user_id)
-            await message.answer(f"Помилка отримання клієнтів з 1С: {exc}")
+            await message.answer(_service_unavailable_message())
             return
         await state.update_data(available_clients=clients)
 
@@ -189,9 +193,9 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
     if not isinstance(client_map, dict):
         try:
             client_map = {client.name: client.id for client in await one_c_service.get_clients()}
-        except OneCServiceError as exc:
+        except OneCServiceError:
             logger.exception("Failed to refresh client map: user_id=%s", user_id)
-            await message.answer(f"Помилка отримання клієнтів з 1С: {exc}")
+            await message.answer(_service_unavailable_message())
             return
         await state.update_data(client_map=client_map)
 
@@ -203,9 +207,9 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
 
     try:
         categories = await one_c_service.get_categories()
-    except OneCServiceError as exc:
+    except OneCServiceError:
         logger.exception("Failed to fetch categories: user_id=%s", user_id)
-        await message.answer(f"Помилка отримання категорій з 1С: {exc}")
+        await message.answer(_service_unavailable_message())
         return
 
     await state.set_state(OrderStates.waiting_for_category)
@@ -236,9 +240,9 @@ async def order_category_handler(message: Message, state: FSMContext) -> None:
             if not isinstance(categories, list):
                 try:
                     categories = await one_c_service.get_categories()
-                except OneCServiceError as exc:
+                except OneCServiceError:
                     logger.exception("Failed to fetch categories on empty cart: user_id=%s", user_id)
-                    await message.answer(f"Помилка отримання категорій з 1С: {exc}")
+                    await message.answer(_service_unavailable_message())
                     return
             await message.answer(
                 "Кошик порожній. Додайте хоча б один товар.",
@@ -249,9 +253,9 @@ async def order_category_handler(message: Message, state: FSMContext) -> None:
         selected_client_id = str(data.get("selected_client_id", "")).strip()
         try:
             trading_points = await one_c_service.get_trading_points(selected_client_id)
-        except OneCServiceError as exc:
+        except OneCServiceError:
             logger.exception("Failed to fetch trading points: user_id=%s client_id=%s", user_id, selected_client_id)
-            await message.answer(f"Помилка отримання торгових точок з 1С: {exc}")
+            await message.answer(_service_unavailable_message())
             return
 
         if not trading_points:
@@ -276,9 +280,9 @@ async def order_category_handler(message: Message, state: FSMContext) -> None:
     if not isinstance(categories, list):
         try:
             categories = await one_c_service.get_categories()
-        except OneCServiceError as exc:
+        except OneCServiceError:
             logger.exception("Failed to refresh categories: user_id=%s", user_id)
-            await message.answer(f"Помилка отримання категорій з 1С: {exc}")
+            await message.answer(_service_unavailable_message())
             return
         await state.update_data(available_categories=categories)
 
@@ -293,9 +297,9 @@ async def order_category_handler(message: Message, state: FSMContext) -> None:
 
     try:
         products = await one_c_service.get_products(selected_category)
-    except OneCServiceError as exc:
+    except OneCServiceError:
         logger.exception("Failed to fetch products: user_id=%s category=%s", user_id, selected_category)
-        await message.answer(f"Помилка отримання товарів з 1С: {exc}")
+        await message.answer(_service_unavailable_message())
         return
 
     product_names = [product.name for product in products]
@@ -339,9 +343,9 @@ async def order_product_handler(message: Message, state: FSMContext) -> None:
     if not isinstance(available_products, list):
         try:
             available_products = [p.name for p in await one_c_service.get_products(selected_category)]
-        except OneCServiceError as exc:
+        except OneCServiceError:
             logger.exception("Failed to refresh products: user_id=%s category=%s", user_id, selected_category)
-            await message.answer(f"Помилка отримання товарів з 1С: {exc}")
+            await message.answer(_service_unavailable_message())
             return
         await state.update_data(available_products=available_products)
 
@@ -361,14 +365,14 @@ async def order_product_handler(message: Message, state: FSMContext) -> None:
     if not isinstance(product_data, dict):
         try:
             product = await one_c_service.find_product(selected_category, selected_product)
-        except OneCServiceError as exc:
+        except OneCServiceError:
             logger.exception(
                 "Failed to find product in 1C: user_id=%s category=%s product=%s",
                 user_id,
                 selected_category,
                 selected_product,
             )
-            await message.answer(f"Помилка отримання товару з 1С: {exc}")
+            await message.answer(_service_unavailable_message())
             return
         if product is None:
             logger.warning(
@@ -448,9 +452,9 @@ async def order_quantity_handler(message: Message, state: FSMContext) -> None:
 
     try:
         categories = await one_c_service.get_categories()
-    except OneCServiceError as exc:
+    except OneCServiceError:
         logger.exception("Failed to fetch categories after item add: user_id=%s", user_id)
-        await message.answer(f"Помилка отримання категорій з 1С: {exc}")
+        await message.answer(_service_unavailable_message())
         return
 
     await state.set_state(OrderStates.waiting_for_category)
@@ -591,9 +595,9 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
             }
             try:
                 result = await one_c_service.create_order(order_payload)
-            except OneCServiceError as exc:
+            except OneCServiceError:
                 logger.exception("Order submit failed: user_id=%s", user_id)
-                await message.answer(f"Помилка відправки замовлення в 1С: {exc}")
+                await message.answer(_service_unavailable_message())
                 return
 
             order_number = str(result.get("order_number", "N/A"))
