@@ -2,6 +2,10 @@ from datetime import date, timedelta
 
 from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 
+PAYMENT_METHOD_CASH = "Готівка"
+PAYMENT_METHOD_NON_CASH = "Безготівка"
+NO_COMMENT_BUTTON_TEXT = "Без коментаря"
+
 
 def build_options_keyboard(options: list[str], extra_buttons: list[str] | None = None) -> ReplyKeyboardMarkup:
     keyboard_rows = [[KeyboardButton(text=option)] for option in options]
@@ -23,3 +27,15 @@ def get_nearest_delivery_dates(days: int = 5) -> list[str]:
 
 def build_delivery_dates_keyboard(days: int = 5) -> ReplyKeyboardMarkup:
     return build_options_keyboard(get_nearest_delivery_dates(days))
+
+
+def get_payment_methods() -> list[str]:
+    return [PAYMENT_METHOD_CASH, PAYMENT_METHOD_NON_CASH]
+
+
+def build_payment_methods_keyboard() -> ReplyKeyboardMarkup:
+    return build_options_keyboard(get_payment_methods())
+
+
+def build_skip_comment_keyboard() -> ReplyKeyboardMarkup:
+    return build_options_keyboard([NO_COMMENT_BUTTON_TEXT])

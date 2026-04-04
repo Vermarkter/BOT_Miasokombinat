@@ -8,3 +8,5 @@ class OrderStates(StatesGroup):
     waiting_for_quantity = State()
     waiting_for_trading_point = State()
     waiting_for_delivery_date = State()
+    waiting_for_payment_method = State()
+    waiting_for_comment = State()

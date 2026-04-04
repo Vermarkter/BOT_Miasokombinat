@@ -7,7 +7,7 @@ from aiogram.types import Message
 
 from app.database import auth_storage
 from app.keyboards import build_main_keyboard, build_request_contact_keyboard
-from app.services import OneCService
+from app.services import OneCService, OneCServiceError
 from app.states import AuthStates
 
 router = Router()
@@ -110,7 +110,13 @@ async def receive_code_handler(message: Message, state: FSMContext) -> None:
         user_id,
         _mask_phone(phone),
     )
-    is_authorized = one_c_service.check_auth(phone=phone, code=code)
+    try:
+        is_authorized = await one_c_service.check_auth(phone=phone, code=code)
+    except OneCServiceError as exc:
+        logger.exception("Authorization check failed due to 1C error: user_id=%s", user_id)
+        await message.answer(f"Помилка зв'язку з 1С: {exc}")
+        return
+
     if is_authorized:
         if user_id is not None:
             auth_storage.set_user_authorization(user_id, "Authorized")
