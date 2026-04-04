@@ -1,7 +1,15 @@
 import logging
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class Client:
+    id: str
+    name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -9,22 +17,33 @@ class Product:
     name: str
     unit: str
     category: str
+    price_per_unit: float
 
 
 class OneCService:
     def __init__(self) -> None:
         self._clients = [
-            "ФОП Петренко",
-            "ТОВ Смак М'яса",
+            Client(id="client_1", name="ФОП Петренко"),
+            Client(id="client_2", name="ТОВ Смак М'яса"),
         ]
         self._catalog: dict[str, list[Product]] = {
             "Ковбаси": [
-                Product(name="Ковбаса Докторська (кг)", unit="кг", category="Ковбаси"),
+                Product(
+                    name="Ковбаса Докторська (кг)",
+                    unit="кг",
+                    category="Ковбаси",
+                    price_per_unit=285.0,
+                ),
             ],
             "Паштети": [
-                Product(name="Паштет (шт)", unit="шт", category="Паштети"),
+                Product(name="Паштет (шт)", unit="шт", category="Паштети", price_per_unit=42.0),
             ],
         }
+        self._trading_points: dict[str, list[str]] = {
+            "client_1": ["Магазин Петренко №1", "Кіоск Петренко Центр"],
+            "client_2": ["Смак М'яса Склад", "Смак М'яса Ринок"],
+        }
+        self._order_counter = 1
 
     def check_auth(self, phone: str, code: str) -> bool:
         masked_phone = f"***{phone[-4:]}" if len(phone) >= 4 else "***"
@@ -38,7 +57,7 @@ class OneCService:
 
         return is_authorized
 
-    def get_clients(self) -> list[str]:
+    def get_clients(self) -> list[Client]:
         logger.info("Fetching clients from 1C mock")
         return list(self._clients)
 
@@ -56,3 +75,17 @@ class OneCService:
             if product.name == product_name:
                 return product
         return None
+
+    def get_trading_points(self, client_id: str) -> list[str]:
+        logger.info("Fetching trading points from 1C mock for client_id=%s", client_id)
+        return list(self._trading_points.get(client_id, []))
+
+    def create_order(self, order_data: dict[str, Any]) -> dict[str, Any]:
+        logger.info("Simulating POST to 1C with order payload: %s", order_data)
+        order_number = f"ORD-{datetime.now().strftime('%Y%m%d')}-{self._order_counter:04d}"
+        self._order_counter += 1
+        logger.info("1C mock order created successfully: order_number=%s", order_number)
+        return {
+            "status": "success",
+            "order_number": order_number,
+        }
