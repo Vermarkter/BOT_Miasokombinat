@@ -11,3 +11,13 @@ class InMemoryStorage:
 
     def get(self, key: str) -> Any | None:
         return self._storage.get(key)
+
+    def set_user_authorization(self, user_id: int, status: str) -> None:
+        self.set(f"user:{user_id}:authorization", status)
+
+    def get_user_authorization(self, user_id: int) -> str | None:
+        value = self.get(f"user:{user_id}:authorization")
+        return value if isinstance(value, str) else None
+
+
+auth_storage = InMemoryStorage()
