@@ -8,7 +8,7 @@ import aiohttp
 from config import get_settings
 
 logger = logging.getLogger(__name__)
-fail_logger = logging.getLogger("one_c_http_failures")
+http_logger = logging.getLogger("one_c_http_requests")
 
 
 class OneCServiceError(Exception):
@@ -30,7 +30,7 @@ class Product:
 
 
 class OneCService:
-    def __init__(self, timeout_sec: int = 15) -> None:
+    def __init__(self, timeout_sec: int = 10) -> None:
         settings = get_settings()
         self.base_url = str(settings.one_c_base_url).rstrip("/") if settings.one_c_base_url else None
         self.username = settings.one_c_username
@@ -39,13 +39,28 @@ class OneCService:
 
     def _build_auth(self) -> aiohttp.BasicAuth:
         if not self.username or not self.password:
-            raise OneCServiceError("ONE_C_USERNAME або ONE_C_PASSWORD не налаштовано.")
+            raise OneCServiceError("Сервіс замовлень не налаштований. Зверніться до адміністратора.")
         return aiohttp.BasicAuth(self.username, self.password)
 
     def _build_url(self, endpoint: str) -> str:
         if not self.base_url:
-            raise OneCServiceError("ONE_C_BASE_URL не налаштовано.")
+            raise OneCServiceError("Адреса сервісу замовлень не налаштована.")
         return f"{self.base_url}/{endpoint.lstrip('/')}"
+
+    @staticmethod
+    def _get_log_headers(auth: aiohttp.BasicAuth | None, has_body: bool) -> dict[str, str]:
+        headers: dict[str, str] = {"Accept": "application/json"}
+        if has_body:
+            headers["Content-Type"] = "application/json"
+        if auth is not None:
+            headers["Authorization"] = "Basic ***"
+        return headers
+
+    @staticmethod
+    def _truncate_body(body: str, max_len: int = 1000) -> str:
+        if len(body) <= max_len:
+            return body
+        return f"{body[:max_len]}...<truncated>"
 
     async def _request_json(
         self,
@@ -59,10 +74,27 @@ class OneCService:
         auth = self._build_auth()
         timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
 
+        log_headers = self._get_log_headers(auth, payload is not None)
+        http_logger.info(
+            "REQUEST | method=%s url=%s headers=%s params=%s body=%s",
+            method,
+            url,
+            log_headers,
+            params,
+            payload,
+        )
+
         try:
             async with aiohttp.ClientSession(timeout=timeout, auth=auth) as session:
                 async with session.request(method, url, params=params, json=payload) as response:
                     raw_body = await response.text()
+                    http_logger.info(
+                        "RESPONSE | method=%s url=%s status=%s body=%s",
+                        method,
+                        url,
+                        response.status,
+                        self._truncate_body(raw_body),
+                    )
 
                     if response.status == 200:
                         if not raw_body.strip():
@@ -71,56 +103,28 @@ class OneCService:
                             return await response.json(content_type=None)
                         except aiohttp.ContentTypeError:
                             logger.error("1C response is not JSON: endpoint=%s body=%s", endpoint, raw_body)
-                            fail_logger.error(
-                                "HTTP failure | endpoint=%s method=%s status=200 invalid_json body=%s",
-                                endpoint,
-                                method,
-                                raw_body,
-                            )
-                            raise OneCServiceError("1C повернула невалідний JSON.")
+                            raise OneCServiceError("Отримано некоректну відповідь від сервісу замовлень.")
 
                     if response.status == 401:
-                        logger.error("1C returned 401 Unauthorized for endpoint=%s", endpoint)
-                        fail_logger.error(
-                            "HTTP failure | endpoint=%s method=%s status=401 body=%s",
-                            endpoint,
-                            method,
-                            raw_body,
-                        )
-                        raise OneCServiceError("Помилка авторизації в 1С (401).")
+                        raise OneCServiceError("Не вдалося авторизуватися в сервісі замовлень.")
 
                     if response.status == 500:
-                        logger.error("1C returned 500 Server Error for endpoint=%s body=%s", endpoint, raw_body)
-                        fail_logger.error(
-                            "HTTP failure | endpoint=%s method=%s status=500 body=%s",
-                            endpoint,
-                            method,
-                            raw_body,
-                        )
-                        raise OneCServiceError("Внутрішня помилка сервера 1С (500).")
+                        raise OneCServiceError("Сервіс замовлень тимчасово недоступний. Спробуйте пізніше.")
 
-                    logger.error(
-                        "1C returned unexpected status: endpoint=%s status=%s body=%s",
-                        endpoint,
-                        response.status,
-                        raw_body,
+                    raise OneCServiceError(
+                        "Сервіс замовлень повернув неочікувану відповідь. Спробуйте пізніше.",
                     )
-                    fail_logger.error(
-                        "HTTP failure | endpoint=%s method=%s status=%s body=%s",
-                        endpoint,
-                        method,
-                        response.status,
-                        raw_body,
-                    )
-                    raise OneCServiceError(f"Неочікуваний HTTP-статус 1С: {response.status}.")
         except asyncio.TimeoutError as exc:
-            logger.exception("1C request timeout: endpoint=%s", endpoint)
-            fail_logger.error("HTTP failure | endpoint=%s method=%s timeout", endpoint, method)
-            raise OneCServiceError("Таймаут з'єднання з 1С.") from exc
+            http_logger.error("REQUEST FAILED | method=%s url=%s error=timeout", method, url)
+            raise OneCServiceError("Сервіс замовлень не відповідає. Спробуйте трохи пізніше.") from exc
         except aiohttp.ClientError as exc:
-            logger.exception("1C request failed: endpoint=%s", endpoint)
-            fail_logger.error("HTTP failure | endpoint=%s method=%s client_error=%s", endpoint, method, str(exc))
-            raise OneCServiceError("1С недоступна або помилка мережі.") from exc
+            http_logger.error(
+                "REQUEST FAILED | method=%s url=%s error=client_error details=%s",
+                method,
+                url,
+                str(exc),
+            )
+            raise OneCServiceError("Не вдалося з'єднатися із сервісом замовлень.") from exc
 
     async def check_auth(self, phone: str, code: str) -> bool:
         masked_phone = f"***{phone[-4:]}" if len(phone) >= 4 else "***"
@@ -204,36 +208,59 @@ class OneCService:
         response = await self._request_json("POST", "orders", payload=order_data)
         order_number = str(response.get("order_number", "")).strip()
         if not order_number:
-            raise OneCServiceError("1C не повернула номер замовлення.")
+            raise OneCServiceError("Не вдалося отримати номер замовлення від сервісу.")
         return {"status": "success", "order_number": order_number}
 
     async def check_base_url_status(self) -> tuple[bool, str]:
+        ok, _, message = await self.check_base_url_get()
+        return ok, message
+
+    async def check_base_url_get(self) -> tuple[bool, int | None, str]:
         url = self._build_url("")
         timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
 
+        auth: aiohttp.BasicAuth | None = None
+        if self.username and self.password:
+            auth = aiohttp.BasicAuth(self.username, self.password)
+
+        log_headers = self._get_log_headers(auth, has_body=False)
+        http_logger.info(
+            "REQUEST | method=%s url=%s headers=%s params=%s body=%s",
+            "GET",
+            url,
+            log_headers,
+            None,
+            None,
+        )
+
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.head(url, allow_redirects=True) as response:
+            async with aiohttp.ClientSession(timeout=timeout, auth=auth) as session:
+                async with session.get(url, allow_redirects=True) as response:
+                    body = await response.text()
                     status = response.status
-                    if status in (405, 501):
-                        async with session.get(url, allow_redirects=True) as get_response:
-                            status = get_response.status
+                    http_logger.info(
+                        "RESPONSE | method=%s url=%s status=%s body=%s",
+                        "GET",
+                        url,
+                        status,
+                        self._truncate_body(body),
+                    )
         except asyncio.TimeoutError:
-            fail_logger.error("HTTP failure | endpoint=%s method=HEAD timeout", url)
-            return False, "Сервіс замовлень не відповідає. Спробуйте трохи пізніше."
+            http_logger.error("REQUEST FAILED | method=%s url=%s error=timeout", "GET", url)
+            return False, None, "Сервіс 1С не відповідає."
         except aiohttp.ClientError as exc:
-            fail_logger.error("HTTP failure | endpoint=%s method=HEAD client_error=%s", url, str(exc))
-            return False, "Немає зв'язку із сервером замовлень."
+            http_logger.error(
+                "REQUEST FAILED | method=%s url=%s error=client_error details=%s",
+                "GET",
+                url,
+                str(exc),
+            )
+            return False, None, "Не вдалося підключитися до сервісу 1С."
 
         if status == 200:
-            return True, "Сервіс замовлень працює."
+            return True, status, "Сервіс 1С доступний."
         if status == 401:
-            return True, "Сервіс замовлень доступний, але потрібна авторизація."
+            return False, status, "Сервіс 1С відповідає, але авторизація не пройшла."
         if status >= 500:
-            fail_logger.error("HTTP failure | endpoint=%s method=HEAD status=%s", url, status)
-            return False, "Сервіс замовлень тимчасово перевантажений."
-
-        if status >= 400:
-            return True, f"Сервіс відповідає (код {status})."
-
-        return True, f"Сервіс працює (код {status})."
+            return False, status, "Сервіс 1С тимчасово недоступний."
+        return True, status, f"Сервіс 1С відповідає (код {status})."
