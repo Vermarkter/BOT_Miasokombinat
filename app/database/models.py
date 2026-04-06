@@ -1,7 +1,16 @@
-from sqlalchemy import Float, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, Float, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.sqlalchemy import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    phone: Mapped[str] = mapped_column(String(20))
+    full_name: Mapped[str] = mapped_column(String(255))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class CartItem(Base):
@@ -17,4 +26,3 @@ class CartItem(Base):
     quantity: Mapped[float] = mapped_column(Float)
     price: Mapped[float] = mapped_column(Float)
     unit: Mapped[str] = mapped_column(String(16))
-

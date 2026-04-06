@@ -5,7 +5,7 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
-from app.database import auth_storage
+from app.database import UserRepository, auth_storage
 from app.keyboards import build_main_keyboard, build_request_contact_keyboard
 from app.services import OneCService, OneCServiceError
 from app.states import AuthStates
@@ -14,6 +14,7 @@ from app.utils import is_valid_phone, normalize_phone
 router = Router()
 logger = logging.getLogger(__name__)
 one_c_service = OneCService()
+user_repository = UserRepository()
 
 
 def _mask_phone(phone: str) -> str:
@@ -130,6 +131,16 @@ async def receive_code_handler(message: Message, state: FSMContext) -> None:
     if is_authorized:
         if user_id is not None:
             auth_storage.set_user_authorization(user_id, "Authorized")
+            full_name = (message.from_user.full_name if message.from_user else "агент").strip()
+            try:
+                await user_repository.upsert_user(
+                    user_id=user_id,
+                    phone=phone,
+                    full_name=full_name,
+                    is_active=True,
+                )
+            except Exception:
+                logger.exception("Failed to persist authorized user profile: user_id=%s", user_id)
         await state.clear()
         logger.info("Authorization success: user_id=%s", user_id)
         await message.answer(

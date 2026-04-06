@@ -1,4 +1,4 @@
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from app.database.models import CartItem
 from app.database.sqlalchemy import session_factory
@@ -74,3 +74,7 @@ class CartRepository:
             await session.execute(delete(CartItem).where(CartItem.user_id == user_id))
             await session.commit()
 
+    async def count_items(self) -> int:
+        async with session_factory() as session:
+            result = await session.execute(select(func.count()).select_from(CartItem))
+            return int(result.scalar_one() or 0)
