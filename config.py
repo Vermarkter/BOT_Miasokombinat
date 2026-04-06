@@ -22,6 +22,10 @@ class Settings(BaseSettings):
         validation_alias="ONE_C_PASSWORD",
     )
     admin_ids: str = Field(default="", validation_alias="ADMIN_IDS")
+    database_url: str = Field(
+        default="sqlite+aiosqlite:///./data/meat_bot.db",
+        validation_alias="DATABASE_URL",
+    )
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
     @property

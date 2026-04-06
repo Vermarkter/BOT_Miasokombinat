@@ -1,10 +1,11 @@
 from datetime import date, timedelta
 
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 PAYMENT_METHOD_CASH = "Готівка"
 PAYMENT_METHOD_NON_CASH = "Безготівка"
 NO_COMMENT_BUTTON_TEXT = "Без коментаря"
+SHOW_CART_BUTTON_TEXT = "Мій кошик"
 
 
 def build_options_keyboard(options: list[str], extra_buttons: list[str] | None = None) -> ReplyKeyboardMarkup:
@@ -39,3 +40,28 @@ def build_payment_methods_keyboard() -> ReplyKeyboardMarkup:
 
 def build_skip_comment_keyboard() -> ReplyKeyboardMarkup:
     return build_options_keyboard([NO_COMMENT_BUTTON_TEXT])
+
+
+def build_cart_inline_keyboard(cart_rows: list[dict[str, str]]) -> InlineKeyboardMarkup:
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    for row in cart_rows:
+        product_id = row["product_id"]
+        product_name = row["product_name"]
+        quantity = row["quantity"]
+        price = row["price"]
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{product_name} - {quantity} - {price} - [Видалити]",
+                    callback_data=f"cart:delete:{product_id}",
+                ),
+            ],
+        )
+
+    if cart_rows:
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(text="Очистити весь кошик", callback_data="cart:clear"),
+            ],
+        )
+    return InlineKeyboardMarkup(inline_keyboard=keyboard_rows)

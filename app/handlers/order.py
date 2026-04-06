@@ -1,15 +1,18 @@
 import logging
+import time
 from typing import Any
 
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message
 
-from app.database import auth_storage
+from app.database import CartRepository, auth_storage
 from app.keyboards import (
     NEW_ORDER_BUTTON_TEXT,
     NO_COMMENT_BUTTON_TEXT,
+    SHOW_CART_BUTTON_TEXT,
+    build_cart_inline_keyboard,
     build_delivery_dates_keyboard,
     build_main_keyboard,
     build_options_keyboard,
@@ -25,10 +28,15 @@ from app.utils import QuantityValidationError, validate_quantity
 router = Router()
 logger = logging.getLogger(__name__)
 one_c_service = OneCService()
+cart_repository = CartRepository()
 
 FINISH_ORDER_BUTTON_TEXT = "Перейти до доставки"
 CONFIRM_ORDER_BUTTON_TEXT = "Підтвердити замовлення"
 CANCEL_ORDER_BUTTON_TEXT = "Скасувати замовлення"
+CART_DELETE_CALLBACK_PREFIX = "cart:delete:"
+CART_CLEAR_CALLBACK = "cart:clear"
+SUBMIT_COOLDOWN_SECONDS = 5.0
+_last_submit_attempts: dict[int, float] = {}
 
 
 def _format_quantity(value: int | float) -> str:
@@ -110,6 +118,64 @@ def _build_order_summary(order_data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+async def _load_cart_from_db(user_id: int) -> list[dict[str, Any]]:
+    db_items = await cart_repository.list_items(user_id)
+    cart: list[dict[str, Any]] = []
+    for item in db_items:
+        quantity = _coerce_quantity(float(item.quantity), item.unit)
+        cart.append(
+            _build_cart_item(
+                product_id=item.product_id,
+                product_name=item.product_name,
+                quantity=quantity,
+                unit=item.unit,
+                price_per_unit=float(item.price),
+            ),
+        )
+    return cart
+
+
+async def _refresh_state_cart(state: FSMContext, user_id: int) -> list[dict[str, Any]]:
+    cart = await _load_cart_from_db(user_id)
+    await state.update_data(cart=cart)
+    return cart
+
+
+async def _send_cart_preview(message: Message, state: FSMContext, user_id: int) -> None:
+    try:
+        cart = await _refresh_state_cart(state, user_id)
+    except Exception:
+        logger.exception("Failed to load cart from database: user_id=%s", user_id)
+        await message.answer("Не вдалося відкрити кошик. Спробуйте ще раз.")
+        return
+
+    if not cart:
+        await message.answer("Кошик порожній. Додайте товари через /order.")
+        return
+
+    rows = _build_cart_inline_rows(cart)
+    await message.answer(
+        f"{_format_cart_summary(cart)}\n\nКерування кошиком:",
+        reply_markup=build_cart_inline_keyboard(rows),
+    )
+
+
+async def _update_cart_callback_message(callback: CallbackQuery, cart: list[dict[str, Any]]) -> None:
+    message = callback.message
+    if message is None:
+        return
+
+    if not cart:
+        await message.edit_text("Кошик порожній.")
+        return
+
+    rows = _build_cart_inline_rows(cart)
+    await message.edit_text(
+        f"{_format_cart_summary(cart)}\n\nКерування кошиком:",
+        reply_markup=build_cart_inline_keyboard(rows),
+    )
+
+
 def _is_authorized(message: Message) -> bool:
     if message.from_user is None:
         return False
@@ -117,7 +183,108 @@ def _is_authorized(message: Message) -> bool:
 
 
 def _service_unavailable_message() -> str:
-    return "?????? ????????? ????????? ???????????. ????????? ?? ??? ????? ???????."
+    return "Сервіс 1С тимчасово недоступний. Спробуйте ще раз трохи пізніше."
+
+
+def _coerce_quantity(value: float, unit: str) -> int | float:
+    if unit == "шт":
+        return int(round(value))
+    return float(value)
+
+
+def _build_cart_item(
+    *,
+    product_id: str,
+    product_name: str,
+    quantity: int | float,
+    unit: str,
+    price_per_unit: float,
+    category: str | None = None,
+) -> dict[str, Any]:
+    line_total = float(quantity) * price_per_unit
+    return {
+        "product_id": product_id,
+        "category": category,
+        "product": product_name,
+        "quantity": quantity,
+        "unit": unit,
+        "price_per_unit": price_per_unit,
+        "line_total": line_total,
+    }
+
+
+def _find_cart_item(cart: list[dict[str, Any]], product_id: str) -> dict[str, Any] | None:
+    for item in cart:
+        if str(item.get("product_id", "")).strip() == product_id:
+            return item
+    return None
+
+
+def _upsert_cart_item_in_memory(
+    cart: list[dict[str, Any]],
+    *,
+    product_id: str,
+    product_name: str,
+    quantity: int | float,
+    unit: str,
+    price_per_unit: float,
+    category: str | None,
+) -> list[dict[str, Any]]:
+    updated_item = _build_cart_item(
+        product_id=product_id,
+        product_name=product_name,
+        quantity=quantity,
+        unit=unit,
+        price_per_unit=price_per_unit,
+        category=category,
+    )
+    for index, item in enumerate(cart):
+        if str(item.get("product_id", "")).strip() == product_id:
+            cart[index] = updated_item
+            return cart
+    cart.append(updated_item)
+    return cart
+
+
+def _category_extra_buttons(cart: list[dict[str, Any]]) -> list[str]:
+    extra_buttons = [SHOW_CART_BUTTON_TEXT]
+    if cart:
+        extra_buttons.insert(0, FINISH_ORDER_BUTTON_TEXT)
+    return extra_buttons
+
+
+def _build_cart_inline_rows(cart: list[dict[str, Any]]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for item in cart:
+        product_id = str(item.get("product_id", "")).strip()
+        if not product_id:
+            continue
+
+        quantity = _format_quantity(item.get("quantity", 0))
+        unit = str(item.get("unit", "")).strip()
+        line_total = float(item.get("line_total", 0))
+        rows.append(
+            {
+                "product_id": product_id,
+                "product_name": str(item.get("product", "-")).strip(),
+                "quantity": f"{quantity} {unit}".strip(),
+                "price": f"{_format_money(line_total)} грн",
+            },
+        )
+    return rows
+
+
+def _is_submit_flood(user_id: int) -> tuple[bool, int]:
+    now = time.monotonic()
+    last_attempt = _last_submit_attempts.get(user_id)
+    if last_attempt is not None:
+        elapsed = now - last_attempt
+        if elapsed < SUBMIT_COOLDOWN_SECONDS:
+            wait_seconds = int(SUBMIT_COOLDOWN_SECONDS - elapsed) + 1
+            return True, wait_seconds
+
+    _last_submit_attempts[user_id] = now
+    return False, 0
 
 
 @router.message(Command("order"))
@@ -143,16 +310,24 @@ async def start_order_handler(message: Message, state: FSMContext) -> None:
         await message.answer("Список клієнтів недоступний. Спробуйте пізніше.")
         return
 
+    restored_cart: list[dict[str, Any]] = []
+    if user_id is not None:
+        try:
+            restored_cart = await _load_cart_from_db(user_id)
+        except Exception:
+            logger.exception("Failed to restore cart from DB: user_id=%s", user_id)
+
     client_map = {client.name: client.id for client in clients}
     await state.set_state(OrderStates.waiting_for_client)
     await state.update_data(
-        cart=[],
+        cart=restored_cart,
         available_clients=list(client_map.keys()),
         client_map=client_map,
         selected_client=None,
         selected_client_id=None,
         selected_category=None,
         selected_product=None,
+        selected_product_id=None,
         selected_unit=None,
         selected_price_per_unit=None,
         selected_trading_point=None,
@@ -160,9 +335,77 @@ async def start_order_handler(message: Message, state: FSMContext) -> None:
         selected_payment_method=None,
         comment=None,
         awaiting_order_confirmation=False,
+        updating_existing_item=False,
     )
     logger.info("Order state set waiting_for_client: user_id=%s", user_id)
+
+    if restored_cart:
+        await message.answer(
+            "Знайдено незавершений кошик. Ви можете переглянути його кнопкою «Мій кошик».",
+        )
+
     await message.answer("Оберіть клієнта:", reply_markup=build_options_keyboard(list(client_map.keys())))
+
+
+@router.message(Command("cart"))
+@router.message(F.text == SHOW_CART_BUTTON_TEXT)
+async def show_cart_handler(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    logger.info("Cart preview requested: user_id=%s", user_id)
+
+    if not _is_authorized(message):
+        await message.answer("Спочатку авторизуйтесь через /start.")
+        return
+
+    if user_id is None:
+        await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
+        return
+
+    await _send_cart_preview(message, state, user_id)
+
+
+@router.callback_query(F.data.startswith(CART_DELETE_CALLBACK_PREFIX))
+async def cart_delete_callback_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id if callback.from_user else None
+    callback_data = callback.data or ""
+    product_id = callback_data.removeprefix(CART_DELETE_CALLBACK_PREFIX).strip()
+    logger.info("Cart item delete requested: user_id=%s product_id=%s", user_id, product_id)
+
+    if user_id is None or not product_id:
+        await callback.answer("Не вдалося видалити позицію.", show_alert=True)
+        return
+
+    try:
+        await cart_repository.delete_item(user_id=user_id, product_id=product_id)
+        cart = await _refresh_state_cart(state, user_id)
+    except Exception:
+        logger.exception("Failed to delete cart item: user_id=%s product_id=%s", user_id, product_id)
+        await callback.answer("Не вдалося видалити позицію. Спробуйте ще раз.", show_alert=True)
+        return
+
+    await callback.answer("Позицію видалено.")
+    await _update_cart_callback_message(callback, cart)
+
+
+@router.callback_query(F.data == CART_CLEAR_CALLBACK)
+async def cart_clear_callback_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id if callback.from_user else None
+    logger.info("Cart clear requested: user_id=%s", user_id)
+
+    if user_id is None:
+        await callback.answer("Не вдалося очистити кошик.", show_alert=True)
+        return
+
+    try:
+        await cart_repository.clear_cart(user_id=user_id)
+        cart = await _refresh_state_cart(state, user_id)
+    except Exception:
+        logger.exception("Failed to clear cart: user_id=%s", user_id)
+        await callback.answer("Не вдалося очистити кошик. Спробуйте ще раз.", show_alert=True)
+        return
+
+    await callback.answer("Кошик очищено.")
+    await _update_cart_callback_message(callback, cart)
 
 
 @router.message(OrderStates.waiting_for_client)
@@ -212,6 +455,9 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
         await message.answer(_service_unavailable_message())
         return
 
+    cart_raw = data.get("cart", [])
+    cart = list(cart_raw) if isinstance(cart_raw, list) else []
+
     await state.set_state(OrderStates.waiting_for_category)
     await state.update_data(
         selected_client=selected_client,
@@ -221,7 +467,7 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
     logger.info("Client selected: user_id=%s client=%s", user_id, selected_client)
     await message.answer(
         f"Клієнт: {selected_client}\nОберіть категорію товару:",
-        reply_markup=build_options_keyboard(categories),
+        reply_markup=build_options_keyboard(categories, _category_extra_buttons(cart)),
     )
 
 
@@ -233,20 +479,37 @@ async def order_category_handler(message: Message, state: FSMContext) -> None:
     cart_raw = data.get("cart", [])
     cart = list(cart_raw) if isinstance(cart_raw, list) else []
 
+    categories = data.get("available_categories")
+    if not isinstance(categories, list):
+        try:
+            categories = await one_c_service.get_categories()
+        except OneCServiceError:
+            logger.exception("Failed to refresh categories: user_id=%s", user_id)
+            await message.answer(_service_unavailable_message())
+            return
+        await state.update_data(available_categories=categories)
+
+    if selected_category == SHOW_CART_BUTTON_TEXT:
+        if user_id is not None:
+            await _send_cart_preview(message, state, user_id)
+        else:
+            await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
+
+        refreshed_data = await state.get_data()
+        refreshed_cart_raw = refreshed_data.get("cart", [])
+        refreshed_cart = list(refreshed_cart_raw) if isinstance(refreshed_cart_raw, list) else []
+        await message.answer(
+            "Оберіть категорію товару:",
+            reply_markup=build_options_keyboard(categories, _category_extra_buttons(refreshed_cart)),
+        )
+        return
+
     if selected_category == FINISH_ORDER_BUTTON_TEXT:
         if not cart:
             logger.info("Finish requested with empty cart: user_id=%s", user_id)
-            categories = data.get("available_categories")
-            if not isinstance(categories, list):
-                try:
-                    categories = await one_c_service.get_categories()
-                except OneCServiceError:
-                    logger.exception("Failed to fetch categories on empty cart: user_id=%s", user_id)
-                    await message.answer(_service_unavailable_message())
-                    return
             await message.answer(
                 "Кошик порожній. Додайте хоча б один товар.",
-                reply_markup=build_options_keyboard(categories),
+                reply_markup=build_options_keyboard(categories, _category_extra_buttons(cart)),
             )
             return
 
@@ -276,22 +539,11 @@ async def order_category_handler(message: Message, state: FSMContext) -> None:
         )
         return
 
-    categories = data.get("available_categories")
-    if not isinstance(categories, list):
-        try:
-            categories = await one_c_service.get_categories()
-        except OneCServiceError:
-            logger.exception("Failed to refresh categories: user_id=%s", user_id)
-            await message.answer(_service_unavailable_message())
-            return
-        await state.update_data(available_categories=categories)
-
     if selected_category not in categories:
         logger.info("Unknown category input: user_id=%s value=%s", user_id, selected_category)
-        extra = [FINISH_ORDER_BUTTON_TEXT] if cart else None
         await message.answer(
             "Оберіть категорію з кнопок нижче.",
-            reply_markup=build_options_keyboard(categories, extra),
+            reply_markup=build_options_keyboard(categories, _category_extra_buttons(cart)),
         )
         return
 
@@ -305,15 +557,15 @@ async def order_category_handler(message: Message, state: FSMContext) -> None:
     product_names = [product.name for product in products]
     if not product_names:
         logger.warning("No products for category: user_id=%s category=%s", user_id, selected_category)
-        extra = [FINISH_ORDER_BUTTON_TEXT] if cart else None
         await message.answer(
             "У цій категорії поки немає товарів. Оберіть іншу.",
-            reply_markup=build_options_keyboard(categories, extra),
+            reply_markup=build_options_keyboard(categories, _category_extra_buttons(cart)),
         )
         return
 
     products_map = {
         product.name: {
+            "product_id": product.id,
             "unit": product.unit,
             "price_per_unit": product.price_per_unit,
         }
@@ -383,24 +635,46 @@ async def order_product_handler(message: Message, state: FSMContext) -> None:
             )
             await message.answer("Не вдалося знайти товар. Оберіть товар ще раз.")
             return
-        product_data = {"unit": product.unit, "price_per_unit": product.price_per_unit}
+        product_data = {
+            "product_id": product.id,
+            "unit": product.unit,
+            "price_per_unit": product.price_per_unit,
+        }
 
+    selected_product_id = str(product_data.get("product_id", selected_product)).strip() or selected_product
     selected_unit = str(product_data.get("unit", "")).strip()
     selected_price_per_unit = float(product_data.get("price_per_unit", 0))
+
+    cart_raw = data.get("cart", [])
+    cart = list(cart_raw) if isinstance(cart_raw, list) else []
+    existing_item = _find_cart_item(cart, selected_product_id)
+
     await state.set_state(OrderStates.waiting_for_quantity)
     await state.update_data(
         selected_product=selected_product,
+        selected_product_id=selected_product_id,
         selected_unit=selected_unit,
         selected_price_per_unit=selected_price_per_unit,
+        updating_existing_item=existing_item is not None,
     )
     logger.info(
-        "Product selected: user_id=%s category=%s product=%s unit=%s price=%.2f",
+        "Product selected: user_id=%s category=%s product=%s product_id=%s unit=%s price=%.2f",
         user_id,
         selected_category,
         selected_product,
+        selected_product_id,
         selected_unit,
         selected_price_per_unit,
     )
+
+    if existing_item is not None:
+        await message.answer(
+            f"Товар «{selected_product}» вже є в кошику: "
+            f"{_format_quantity(existing_item.get('quantity', 0))} {selected_unit}.\n"
+            "Введіть нову кількість, щоб оновити цю позицію.",
+        )
+        return
+
     await message.answer(f"Введіть кількість для «{selected_product}» ({selected_unit}).")
 
 
@@ -410,11 +684,12 @@ async def order_quantity_handler(message: Message, state: FSMContext) -> None:
     raw_quantity = (message.text or "").strip()
     data = await state.get_data()
 
-    selected_client = str(data.get("selected_client", "")).strip()
     selected_category = str(data.get("selected_category", "")).strip()
     selected_product = str(data.get("selected_product", "")).strip()
+    selected_product_id = str(data.get("selected_product_id", selected_product)).strip() or selected_product
     selected_unit = str(data.get("selected_unit", "")).strip()
     selected_price_per_unit = float(data.get("selected_price_per_unit", 0))
+    is_update = bool(data.get("updating_existing_item"))
     cart_raw = data.get("cart", [])
     cart = list(cart_raw) if isinstance(cart_raw, list) else []
 
@@ -432,20 +707,41 @@ async def order_quantity_handler(message: Message, state: FSMContext) -> None:
         await message.answer(str(exc))
         return
 
-    cart_item = {
-        "client": selected_client,
-        "category": selected_category,
-        "product": selected_product,
-        "quantity": quantity,
-        "unit": selected_unit,
-        "price_per_unit": selected_price_per_unit,
-        "line_total": float(quantity) * selected_price_per_unit,
-    }
-    cart.append(cart_item)
+    if user_id is not None:
+        try:
+            await cart_repository.upsert_item(
+                user_id=user_id,
+                product_id=selected_product_id,
+                product_name=selected_product,
+                quantity=float(quantity),
+                price=selected_price_per_unit,
+                unit=selected_unit,
+            )
+            cart = await _load_cart_from_db(user_id)
+        except Exception:
+            logger.exception(
+                "Failed to upsert cart item in DB: user_id=%s product_id=%s",
+                user_id,
+                selected_product_id,
+            )
+            await message.answer("Не вдалося зберегти товар у кошик. Спробуйте ще раз.")
+            return
+    else:
+        cart = _upsert_cart_item_in_memory(
+            cart,
+            product_id=selected_product_id,
+            product_name=selected_product,
+            quantity=quantity,
+            unit=selected_unit,
+            price_per_unit=selected_price_per_unit,
+            category=selected_category,
+        )
+
     logger.info(
-        "Item added to cart: user_id=%s product=%s quantity=%s unit=%s",
+        "Cart item upserted: user_id=%s product=%s product_id=%s quantity=%s unit=%s",
         user_id,
         selected_product,
+        selected_product_id,
         _format_quantity(quantity),
         selected_unit,
     )
@@ -453,7 +749,7 @@ async def order_quantity_handler(message: Message, state: FSMContext) -> None:
     try:
         categories = await one_c_service.get_categories()
     except OneCServiceError:
-        logger.exception("Failed to fetch categories after item add: user_id=%s", user_id)
+        logger.exception("Failed to fetch categories after item upsert: user_id=%s", user_id)
         await message.answer(_service_unavailable_message())
         return
 
@@ -462,14 +758,18 @@ async def order_quantity_handler(message: Message, state: FSMContext) -> None:
         cart=cart,
         available_categories=categories,
         selected_product=None,
+        selected_product_id=None,
         selected_unit=None,
         selected_price_per_unit=None,
         products_map={},
+        updating_existing_item=False,
     )
+
+    action_text = "Кількість оновлено в кошику." if is_update else "Товар додано в кошик."
     await message.answer(
-        f"Товар додано в кошик.\n{_format_cart_summary(cart)}\n"
-        f"Оберіть наступну категорію або натисніть «{FINISH_ORDER_BUTTON_TEXT}».",
-        reply_markup=build_options_keyboard(categories, [FINISH_ORDER_BUTTON_TEXT]),
+        f"{action_text}\n{_format_cart_summary(cart)}\n"
+        f"Оберіть наступну категорію, «{SHOW_CART_BUTTON_TEXT}» або «{FINISH_ORDER_BUTTON_TEXT}».",
+        reply_markup=build_options_keyboard(categories, _category_extra_buttons(cart)),
     )
 
 
@@ -584,6 +884,14 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
     awaiting_confirmation = bool(data.get("awaiting_order_confirmation"))
     if awaiting_confirmation:
         if user_value == CONFIRM_ORDER_BUTTON_TEXT:
+            if user_id is not None:
+                is_flood, wait_seconds = _is_submit_flood(user_id)
+                if is_flood:
+                    await message.answer(
+                        f"Запит уже обробляється. Зачекайте {wait_seconds} сек. і повторіть підтвердження.",
+                    )
+                    return
+
             order_payload = {
                 "client_id": data.get("selected_client_id"),
                 "client_name": data.get("selected_client"),
@@ -596,9 +904,17 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
             try:
                 result = await one_c_service.create_order(order_payload)
             except OneCServiceError:
+                if user_id is not None:
+                    _last_submit_attempts.pop(user_id, None)
                 logger.exception("Order submit failed: user_id=%s", user_id)
                 await message.answer(_service_unavailable_message())
                 return
+
+            if user_id is not None:
+                try:
+                    await cart_repository.clear_cart(user_id)
+                except Exception:
+                    logger.exception("Failed to clear cart after order submit: user_id=%s", user_id)
 
             order_number = str(result.get("order_number", "N/A"))
             await state.clear()
@@ -613,7 +929,7 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
             await state.clear()
             logger.info("Order submission cancelled by user: user_id=%s", user_id)
             await message.answer(
-                "Замовлення скасовано.",
+                "Замовлення скасовано. Кошик збережено, можете повернутись до нього пізніше.",
                 reply_markup=build_main_keyboard(),
             )
             return

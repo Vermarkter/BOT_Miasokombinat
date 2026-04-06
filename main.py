@@ -4,6 +4,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
+from app.database import init_db
 from app.handlers import get_routers
 from app.utils.logger import setup_logging
 from config import get_settings
@@ -12,6 +13,7 @@ from config import get_settings
 async def main() -> None:
     settings = get_settings()
     setup_logging(settings.log_level)
+    await init_db()
 
     bot = Bot(
         token=settings.bot_token,

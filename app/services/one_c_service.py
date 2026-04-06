@@ -23,6 +23,7 @@ class Client:
 
 @dataclass(frozen=True, slots=True)
 class Product:
+    id: str
     name: str
     unit: str
     category: str
@@ -173,6 +174,7 @@ class OneCService:
             name = str(row.get("name", "")).strip()
             unit = str(row.get("unit", "")).strip()
             category_value = str(row.get("category", category)).strip()
+            product_id = str(row.get("id", "")).strip() or name
             price = row.get("price_per_unit", 0)
             if not name or not unit:
                 continue
@@ -182,6 +184,7 @@ class OneCService:
                 price_per_unit = 0.0
             products.append(
                 Product(
+                    id=product_id,
                     name=name,
                     unit=unit,
                     category=category_value,
