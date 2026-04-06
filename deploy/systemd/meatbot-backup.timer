@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Meat Bot DB backup once per day
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=meatbot-backup.service
+
+[Install]
+WantedBy=timers.target

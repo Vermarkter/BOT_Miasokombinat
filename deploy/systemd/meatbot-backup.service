@@ -1,0 +1,12 @@
+[Unit]
+Description=Backup SQLite database for Meat Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=meatbot
+Group=meatbot
+WorkingDirectory=/opt/BOT_Miasokombinat
+EnvironmentFile=/opt/BOT_Miasokombinat/.env
+ExecStart=/usr/bin/env python3 scripts/backup_db.py

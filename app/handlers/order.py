@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from typing import Any
@@ -37,6 +38,7 @@ CART_DELETE_CALLBACK_PREFIX = "cart:delete:"
 CART_CLEAR_CALLBACK = "cart:clear"
 SUBMIT_COOLDOWN_SECONDS = 5.0
 _last_submit_attempts: dict[int, float] = {}
+_submit_locks: dict[int, asyncio.Lock] = {}
 
 
 def _format_quantity(value: int | float) -> str:
@@ -287,6 +289,14 @@ def _is_submit_flood(user_id: int) -> tuple[bool, int]:
     return False, 0
 
 
+def _get_submit_lock(user_id: int) -> asyncio.Lock:
+    lock = _submit_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _submit_locks[user_id] = lock
+    return lock
+
+
 @router.message(Command("order"))
 @router.message(F.text == NEW_ORDER_BUTTON_TEXT)
 async def start_order_handler(message: Message, state: FSMContext) -> None:
@@ -335,6 +345,7 @@ async def start_order_handler(message: Message, state: FSMContext) -> None:
         selected_payment_method=None,
         comment=None,
         awaiting_order_confirmation=False,
+        order_submission_in_progress=False,
         updating_existing_item=False,
     )
     logger.info("Order state set waiting_for_client: user_id=%s", user_id)
@@ -799,6 +810,7 @@ async def order_trading_point_handler(message: Message, state: FSMContext) -> No
         selected_payment_method=None,
         comment=None,
         awaiting_order_confirmation=False,
+        order_submission_in_progress=False,
     )
     logger.info("Trading point selected: user_id=%s point=%s", user_id, selected_trading_point)
     await message.answer(
@@ -867,6 +879,7 @@ async def order_payment_method_handler(message: Message, state: FSMContext) -> N
         selected_payment_method=selected_payment_method,
         comment=None,
         awaiting_order_confirmation=False,
+        order_submission_in_progress=False,
     )
     logger.info("Payment method selected: user_id=%s method=%s", user_id, selected_payment_method)
     await message.answer(
@@ -884,7 +897,25 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
     awaiting_confirmation = bool(data.get("awaiting_order_confirmation"))
     if awaiting_confirmation:
         if user_value == CONFIRM_ORDER_BUTTON_TEXT:
-            if user_id is not None:
+            if user_id is None:
+                await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
+                return
+
+            submit_lock = _get_submit_lock(user_id)
+            if submit_lock.locked():
+                await message.answer("Замовлення вже відправляється. Зачекайте, будь ласка.")
+                return
+
+            async with submit_lock:
+                fresh_data = await state.get_data()
+                if not bool(fresh_data.get("awaiting_order_confirmation")):
+                    await message.answer("Замовлення вже оброблено.")
+                    return
+
+                if bool(fresh_data.get("order_submission_in_progress")):
+                    await message.answer("Замовлення вже відправляється. Зачекайте, будь ласка.")
+                    return
+
                 is_flood, wait_seconds = _is_submit_flood(user_id)
                 if is_flood:
                     await message.answer(
@@ -892,38 +923,38 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
                     )
                     return
 
-            order_payload = {
-                "client_id": data.get("selected_client_id"),
-                "client_name": data.get("selected_client"),
-                "trading_point": data.get("selected_trading_point"),
-                "delivery_date": data.get("selected_delivery_date"),
-                "payment_method": data.get("selected_payment_method"),
-                "comment": data.get("comment"),
-                "items": data.get("cart", []),
-            }
-            try:
-                result = await one_c_service.create_order(order_payload)
-            except OneCServiceError:
-                if user_id is not None:
+                await state.update_data(order_submission_in_progress=True)
+                order_payload = {
+                    "client_id": fresh_data.get("selected_client_id"),
+                    "client_name": fresh_data.get("selected_client"),
+                    "trading_point": fresh_data.get("selected_trading_point"),
+                    "delivery_date": fresh_data.get("selected_delivery_date"),
+                    "payment_method": fresh_data.get("selected_payment_method"),
+                    "comment": fresh_data.get("comment"),
+                    "items": fresh_data.get("cart", []),
+                }
+                try:
+                    result = await one_c_service.create_order(order_payload)
+                except OneCServiceError:
                     _last_submit_attempts.pop(user_id, None)
-                logger.exception("Order submit failed: user_id=%s", user_id)
-                await message.answer(_service_unavailable_message())
-                return
+                    await state.update_data(order_submission_in_progress=False)
+                    logger.exception("Order submit failed: user_id=%s", user_id)
+                    await message.answer(_service_unavailable_message())
+                    return
 
-            if user_id is not None:
                 try:
                     await cart_repository.clear_cart(user_id)
                 except Exception:
                     logger.exception("Failed to clear cart after order submit: user_id=%s", user_id)
 
-            order_number = str(result.get("order_number", "N/A"))
-            await state.clear()
-            logger.info("Order submitted successfully: user_id=%s order_number=%s", user_id, order_number)
-            await message.answer(
-                f"Замовлення успішно відправлено в 1С.\nНомер замовлення: {order_number}",
-                reply_markup=build_main_keyboard(),
-            )
-            return
+                order_number = str(result.get("order_number", "N/A"))
+                await state.clear()
+                logger.info("Order submitted successfully: user_id=%s order_number=%s", user_id, order_number)
+                await message.answer(
+                    f"Замовлення успішно відправлено в 1С.\nНомер замовлення: {order_number}",
+                    reply_markup=build_main_keyboard(),
+                )
+                return
 
         if user_value == CANCEL_ORDER_BUTTON_TEXT:
             await state.clear()
@@ -956,6 +987,7 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
     await state.update_data(
         comment=comment,
         awaiting_order_confirmation=True,
+        order_submission_in_progress=False,
     )
     updated_data = await state.get_data()
     summary_text = _build_order_summary(updated_data)

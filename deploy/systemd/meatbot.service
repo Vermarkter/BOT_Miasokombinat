@@ -1,0 +1,17 @@
+[Unit]
+Description=Meat Plant Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meatbot
+Group=meatbot
+WorkingDirectory=/opt/BOT_Miasokombinat
+EnvironmentFile=/opt/BOT_Miasokombinat/.env
+ExecStart=/usr/bin/env python3 main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

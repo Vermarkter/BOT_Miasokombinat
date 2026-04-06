@@ -26,6 +26,8 @@ class Settings(BaseSettings):
         default="sqlite+aiosqlite:///./data/meat_bot.db",
         validation_alias="DATABASE_URL",
     )
+    backup_dir: str = Field(default="./backups", validation_alias="BACKUP_DIR")
+    backup_retention_days: int = Field(default=30, validation_alias="BACKUP_RETENTION_DAYS")
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
     @property

@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.log
 data/
+backups/
 .env
 .idea/
 .vscode/
