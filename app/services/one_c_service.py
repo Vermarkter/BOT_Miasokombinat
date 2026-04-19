@@ -57,20 +57,20 @@ class OneCService:
         self,
         *,
         auth: aiohttp.BasicAuth,
-        telegram_user_id: int,
+        user_id: int,
         has_body: bool,
     ) -> tuple[dict[str, str], dict[str, str]]:
         if not self.x_bot_token:
             raise OneCServiceError("Секретний ключ 1С не налаштований. Зверніться до адміністратора.")
-        if telegram_user_id <= 0:
+        if user_id <= 0:
             raise OneCServiceError("Не вдалося визначити користувача Telegram для запиту в 1С.")
 
         request_headers: dict[str, str] = {
             "Accept": "application/json",
             "Authorization": auth.encode(),
             "X-Bot-Token": self.x_bot_token,
-            "X-Telegram-User-ID": str(telegram_user_id),
         }
+        request_headers["X-Telegram-User-ID"] = str(user_id)
         if has_body:
             request_headers["Content-Type"] = "application/json"
 
@@ -78,8 +78,8 @@ class OneCService:
             "Accept": "application/json",
             "Authorization": "Basic ***",
             "X-Bot-Token": "***",
-            "X-Telegram-User-ID": str(telegram_user_id),
         }
+        log_headers["X-Telegram-User-ID"] = str(user_id)
         if has_body:
             log_headers["Content-Type"] = "application/json"
         return request_headers, log_headers
@@ -104,7 +104,7 @@ class OneCService:
         timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
         request_headers, log_headers = self._build_headers(
             auth=auth,
-            telegram_user_id=telegram_user_id,
+            user_id=telegram_user_id,
             has_body=payload is not None,
         )
 
@@ -322,7 +322,7 @@ class OneCService:
         auth = self._build_auth()
         request_headers, log_headers = self._build_headers(
             auth=auth,
-            telegram_user_id=telegram_user_id,
+            user_id=telegram_user_id,
             has_body=False,
         )
 
