@@ -1,5 +1,5 @@
 from app.services.one_c_client import OneCClient, OneCCommunicationError, OrderPayload
-from app.services.one_c_service import Client, OneCService, OneCServiceError, Product
+from app.services.one_c_service import AuthAgent, Client, OneCService, OneCServiceError, Product
 
 __all__ = [
     "OneCClient",
@@ -7,6 +7,7 @@ __all__ = [
     "OrderPayload",
     "OneCService",
     "OneCServiceError",
+    "AuthAgent",
     "Product",
     "Client",
 ]

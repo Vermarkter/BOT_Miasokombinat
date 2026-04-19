@@ -120,6 +120,65 @@ def _build_order_summary(order_data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if isinstance(value, str):
+            value = value.replace(",", ".")
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_create_order_payload(order_data: dict[str, Any]) -> dict[str, Any]:
+    cart_raw = order_data.get("cart", [])
+    cart = list(cart_raw) if isinstance(cart_raw, list) else []
+
+    items: list[dict[str, Any]] = []
+    for raw_item in cart:
+        if not isinstance(raw_item, dict):
+            continue
+
+        product_id = str(
+            raw_item.get("product_id")
+            or raw_item.get("id")
+            or raw_item.get("product_uuid")
+            or ""
+        ).strip()
+        if not product_id:
+            continue
+
+        unit = str(raw_item.get("unit", "")).strip()
+        quantity_raw = _to_float(raw_item.get("quantity", 0), default=0.0)
+        quantity = _coerce_quantity(quantity_raw, unit)
+        price_per_unit = _to_float(
+            raw_item.get("price_per_unit", raw_item.get("price", raw_item.get("unit_price", 0))),
+            default=0.0,
+        )
+        line_total = _to_float(raw_item.get("line_total"), default=float(quantity) * price_per_unit)
+
+        items.append(
+            {
+                "id": product_id,
+                "product_id": product_id,
+                "product_name": str(raw_item.get("product", raw_item.get("product_name", "Товар"))).strip(),
+                "quantity": quantity,
+                "unit": unit,
+                "price_per_unit": price_per_unit,
+                "line_total": line_total,
+            },
+        )
+
+    return {
+        "client_id": str(order_data.get("selected_client_id", "")).strip(),
+        "client_name": str(order_data.get("selected_client", "")).strip(),
+        "trading_point": str(order_data.get("selected_trading_point", "")).strip(),
+        "delivery_date": str(order_data.get("selected_delivery_date", "")).strip(),
+        "payment_method": str(order_data.get("selected_payment_method", "")).strip(),
+        "comment": order_data.get("comment"),
+        "items": items,
+    }
+
+
 async def _load_cart_from_db(user_id: int) -> list[dict[str, Any]]:
     db_items = await cart_repository.list_items(user_id)
     cart: list[dict[str, Any]] = []
@@ -943,15 +1002,7 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
                     return
 
                 await state.update_data(order_submission_in_progress=True)
-                order_payload = {
-                    "client_id": fresh_data.get("selected_client_id"),
-                    "client_name": fresh_data.get("selected_client"),
-                    "trading_point": fresh_data.get("selected_trading_point"),
-                    "delivery_date": fresh_data.get("selected_delivery_date"),
-                    "payment_method": fresh_data.get("selected_payment_method"),
-                    "comment": fresh_data.get("comment"),
-                    "items": fresh_data.get("cart", []),
-                }
+                order_payload = _build_create_order_payload(fresh_data)
                 try:
                     result = await one_c_service.create_order(
                         order_payload,

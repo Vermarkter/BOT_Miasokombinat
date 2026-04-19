@@ -11,6 +11,8 @@ class UserRepository:
         user_id: int,
         phone: str,
         full_name: str,
+        agent_id: str | None = None,
+        agent_name: str | None = None,
         is_active: bool = True,
     ) -> User:
         async with session_factory() as session:
@@ -21,17 +23,26 @@ class UserRepository:
                     user_id=user_id,
                     phone=phone,
                     full_name=full_name,
+                    agent_id=agent_id,
+                    agent_name=agent_name,
                     is_active=is_active,
                 )
                 session.add(user)
             else:
                 user.phone = phone
                 user.full_name = full_name
+                user.agent_id = agent_id
+                user.agent_name = agent_name
                 user.is_active = is_active
 
             await session.commit()
             await session.refresh(user)
             return user
+
+    async def get_by_user_id(self, user_id: int) -> User | None:
+        async with session_factory() as session:
+            result = await session.execute(select(User).where(User.user_id == user_id))
+            return result.scalar_one_or_none()
 
     async def set_is_active(self, user_id: int, is_active: bool) -> None:
         async with session_factory() as session:

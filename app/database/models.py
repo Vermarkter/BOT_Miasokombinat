@@ -10,6 +10,8 @@ class User(Base):
     user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     phone: Mapped[str] = mapped_column(String(20))
     full_name: Mapped[str] = mapped_column(String(255))
+    agent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
