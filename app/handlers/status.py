@@ -25,7 +25,9 @@ async def service_status_handler(message: Message) -> None:
     logger.info("Status command requested: user_id=%s", user_id)
 
     try:
-        is_available, status_text = await one_c_service.check_base_url_status()
+        is_available, status_text = await one_c_service.check_base_url_status(
+            telegram_user_id=int(user_id or 0),
+        )
     except OneCServiceError:
         logger.exception("Status check failed due to configuration issue: user_id=%s", user_id)
         await message.answer("Сервіс перевірки ще не налаштований. Зверніться до керівника або техпідтримки.")
@@ -48,7 +50,9 @@ async def check_1c_handler(message: Message) -> None:
         return
 
     try:
-        is_available, status_code, status_text = await one_c_service.check_base_url_get()
+        is_available, status_code, status_text = await one_c_service.check_base_url_get(
+            telegram_user_id=int(user_id or 0),
+        )
     except OneCServiceError:
         logger.exception("check_1c failed due to configuration issue: user_id=%s", user_id)
         await message.answer("Сервіс 1С ще не налаштований.")

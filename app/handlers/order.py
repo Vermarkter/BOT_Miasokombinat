@@ -309,7 +309,7 @@ async def start_order_handler(message: Message, state: FSMContext) -> None:
         return
 
     try:
-        clients = await one_c_service.get_clients()
+        clients = await one_c_service.get_clients(telegram_user_id=int(user_id or 0))
     except OneCServiceError:
         logger.exception("Failed to fetch clients: user_id=%s", user_id)
         await message.answer(_service_unavailable_message())
@@ -428,7 +428,10 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
     clients = data.get("available_clients")
     if not isinstance(clients, list):
         try:
-            clients = [client.name for client in await one_c_service.get_clients()]
+            clients = [
+                client.name
+                for client in await one_c_service.get_clients(telegram_user_id=int(user_id or 0))
+            ]
         except OneCServiceError:
             logger.exception("Failed to refresh clients: user_id=%s", user_id)
             await message.answer(_service_unavailable_message())
@@ -446,7 +449,10 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
     client_map = data.get("client_map")
     if not isinstance(client_map, dict):
         try:
-            client_map = {client.name: client.id for client in await one_c_service.get_clients()}
+            client_map = {
+                client.name: client.id
+                for client in await one_c_service.get_clients(telegram_user_id=int(user_id or 0))
+            }
         except OneCServiceError:
             logger.exception("Failed to refresh client map: user_id=%s", user_id)
             await message.answer(_service_unavailable_message())
@@ -460,7 +466,7 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
         return
 
     try:
-        categories = await one_c_service.get_categories()
+        categories = await one_c_service.get_categories(telegram_user_id=int(user_id or 0))
     except OneCServiceError:
         logger.exception("Failed to fetch categories: user_id=%s", user_id)
         await message.answer(_service_unavailable_message())
@@ -493,7 +499,7 @@ async def order_category_handler(message: Message, state: FSMContext) -> None:
     categories = data.get("available_categories")
     if not isinstance(categories, list):
         try:
-            categories = await one_c_service.get_categories()
+            categories = await one_c_service.get_categories(telegram_user_id=int(user_id or 0))
         except OneCServiceError:
             logger.exception("Failed to refresh categories: user_id=%s", user_id)
             await message.answer(_service_unavailable_message())
@@ -526,7 +532,10 @@ async def order_category_handler(message: Message, state: FSMContext) -> None:
 
         selected_client_id = str(data.get("selected_client_id", "")).strip()
         try:
-            trading_points = await one_c_service.get_trading_points(selected_client_id)
+            trading_points = await one_c_service.get_trading_points(
+                selected_client_id,
+                telegram_user_id=int(user_id or 0),
+            )
         except OneCServiceError:
             logger.exception("Failed to fetch trading points: user_id=%s client_id=%s", user_id, selected_client_id)
             await message.answer(_service_unavailable_message())
@@ -559,7 +568,7 @@ async def order_category_handler(message: Message, state: FSMContext) -> None:
         return
 
     try:
-        products = await one_c_service.get_products(selected_category)
+        products = await one_c_service.get_products(selected_category, telegram_user_id=int(user_id or 0))
     except OneCServiceError:
         logger.exception("Failed to fetch products: user_id=%s category=%s", user_id, selected_category)
         await message.answer(_service_unavailable_message())
@@ -605,7 +614,13 @@ async def order_product_handler(message: Message, state: FSMContext) -> None:
     available_products = data.get("available_products")
     if not isinstance(available_products, list):
         try:
-            available_products = [p.name for p in await one_c_service.get_products(selected_category)]
+            available_products = [
+                p.name
+                for p in await one_c_service.get_products(
+                    selected_category,
+                    telegram_user_id=int(user_id or 0),
+                )
+            ]
         except OneCServiceError:
             logger.exception("Failed to refresh products: user_id=%s category=%s", user_id, selected_category)
             await message.answer(_service_unavailable_message())
@@ -627,7 +642,11 @@ async def order_product_handler(message: Message, state: FSMContext) -> None:
     product_data = products_map.get(selected_product)
     if not isinstance(product_data, dict):
         try:
-            product = await one_c_service.find_product(selected_category, selected_product)
+            product = await one_c_service.find_product(
+                selected_category,
+                selected_product,
+                telegram_user_id=int(user_id or 0),
+            )
         except OneCServiceError:
             logger.exception(
                 "Failed to find product in 1C: user_id=%s category=%s product=%s",
@@ -758,7 +777,7 @@ async def order_quantity_handler(message: Message, state: FSMContext) -> None:
     )
 
     try:
-        categories = await one_c_service.get_categories()
+        categories = await one_c_service.get_categories(telegram_user_id=int(user_id or 0))
     except OneCServiceError:
         logger.exception("Failed to fetch categories after item upsert: user_id=%s", user_id)
         await message.answer(_service_unavailable_message())
@@ -934,7 +953,10 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
                     "items": fresh_data.get("cart", []),
                 }
                 try:
-                    result = await one_c_service.create_order(order_payload)
+                    result = await one_c_service.create_order(
+                        order_payload,
+                        telegram_user_id=int(user_id or 0),
+                    )
                 except OneCServiceError:
                     _last_submit_attempts.pop(user_id, None)
                     await state.update_data(order_submission_in_progress=False)

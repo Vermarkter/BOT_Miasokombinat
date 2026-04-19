@@ -69,11 +69,46 @@ async def receive_phone_handler(message: Message, state: FSMContext) -> None:
         )
         return
 
-    phone = contact.phone_number.strip()
+    if user_id is None:
+        logger.warning("Cannot process contact without Telegram user id")
+        await message.answer(
+            "Не вдалося визначити ваш Telegram ID. Спробуйте ще раз.",
+            reply_markup=build_request_contact_keyboard(),
+        )
+        return
+
+    phone_raw = contact.phone_number.strip()
+    phone = normalize_phone(phone_raw)
+    if not phone or not is_valid_phone(phone):
+        logger.warning("Invalid phone format in contact: user_id=%s phone=%s", user_id, _mask_phone(phone_raw))
+        await message.answer(
+            "Номер телефону некоректний. Надішліть контакт ще раз.",
+            reply_markup=build_request_contact_keyboard(),
+        )
+        return
+
     logger.info("Phone received: user_id=%s phone=%s", user_id, _mask_phone(phone))
+    try:
+        is_bound = await one_c_service.bind_telegram_user(phone=phone, telegram_user_id=user_id)
+    except OneCServiceError:
+        logger.exception("1C telegram bind failed: user_id=%s", user_id)
+        await message.answer(
+            "Не вдалося перевірити контакт у 1С зараз. Спробуйте ще раз трохи пізніше.",
+            reply_markup=build_request_contact_keyboard(),
+        )
+        return
+
+    if not is_bound:
+        logger.warning("1C rejected telegram bind: user_id=%s", user_id)
+        await message.answer(
+            "1С не підтвердила ваш контакт. Перевірте номер і зверніться до адміністратора.",
+            reply_markup=build_request_contact_keyboard(),
+        )
+        return
+
     await state.update_data(phone=phone)
     await state.set_state(AuthStates.waiting_for_code)
-    await message.answer("Введіть код авторизації.")
+    await message.answer("Контакт підтверджено в 1С. Введіть код авторизації.")
 
 
 @router.message(AuthStates.waiting_for_phone)
@@ -121,8 +156,17 @@ async def receive_code_handler(message: Message, state: FSMContext) -> None:
         user_id,
         _mask_phone(phone),
     )
+    if user_id is None:
+        logger.warning("Cannot check auth without Telegram user id")
+        await message.answer("Не вдалося визначити ваш Telegram ID. Перезапустіть /start.")
+        return
+
     try:
-        is_authorized = await one_c_service.check_auth(phone=phone, code=code)
+        is_authorized = await one_c_service.check_auth(
+            phone=phone,
+            code=code,
+            telegram_user_id=user_id,
+        )
     except OneCServiceError:
         logger.exception("Authorization check failed due to 1C error: user_id=%s", user_id)
         await message.answer("Не вдалося виконати перевірку зараз. Спробуйте ще раз трохи пізніше.")

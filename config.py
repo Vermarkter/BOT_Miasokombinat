@@ -21,6 +21,10 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="ONE_C_PASSWORD",
     )
+    one_c_x_bot_token: SecretStr | None = Field(
+        default=None,
+        validation_alias="ONE_C_X_BOT_TOKEN",
+    )
     admin_ids: str = Field(default="", validation_alias="ADMIN_IDS")
     database_url: str = Field(
         default="sqlite+aiosqlite:///./data/meat_bot.db",

@@ -36,6 +36,11 @@ class OneCService:
         self.base_url = str(settings.one_c_base_url).rstrip("/") if settings.one_c_base_url else None
         self.username = settings.one_c_username
         self.password = settings.one_c_password.get_secret_value() if settings.one_c_password else None
+        self.x_bot_token = (
+            settings.one_c_x_bot_token.get_secret_value()
+            if settings.one_c_x_bot_token is not None
+            else None
+        )
         self.timeout_sec = timeout_sec
 
     def _build_auth(self) -> aiohttp.BasicAuth:
@@ -48,14 +53,36 @@ class OneCService:
             raise OneCServiceError("Адреса сервісу замовлень не налаштована.")
         return f"{self.base_url}/{endpoint.lstrip('/')}"
 
-    @staticmethod
-    def _get_log_headers(auth: aiohttp.BasicAuth | None, has_body: bool) -> dict[str, str]:
-        headers: dict[str, str] = {"Accept": "application/json"}
+    def _build_headers(
+        self,
+        *,
+        auth: aiohttp.BasicAuth,
+        telegram_user_id: int,
+        has_body: bool,
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        if not self.x_bot_token:
+            raise OneCServiceError("Секретний ключ 1С не налаштований. Зверніться до адміністратора.")
+        if telegram_user_id <= 0:
+            raise OneCServiceError("Не вдалося визначити користувача Telegram для запиту в 1С.")
+
+        request_headers: dict[str, str] = {
+            "Accept": "application/json",
+            "Authorization": auth.encode(),
+            "X-Bot-Token": self.x_bot_token,
+            "X-Telegram-User-ID": str(telegram_user_id),
+        }
         if has_body:
-            headers["Content-Type"] = "application/json"
-        if auth is not None:
-            headers["Authorization"] = "Basic ***"
-        return headers
+            request_headers["Content-Type"] = "application/json"
+
+        log_headers = {
+            "Accept": "application/json",
+            "Authorization": "Basic ***",
+            "X-Bot-Token": "***",
+            "X-Telegram-User-ID": str(telegram_user_id),
+        }
+        if has_body:
+            log_headers["Content-Type"] = "application/json"
+        return request_headers, log_headers
 
     @staticmethod
     def _truncate_body(body: str, max_len: int = 1000) -> str:
@@ -68,14 +95,19 @@ class OneCService:
         method: str,
         endpoint: str,
         *,
+        telegram_user_id: int,
         params: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
     ) -> Any:
         url = self._build_url(endpoint)
         auth = self._build_auth()
         timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
+        request_headers, log_headers = self._build_headers(
+            auth=auth,
+            telegram_user_id=telegram_user_id,
+            has_body=payload is not None,
+        )
 
-        log_headers = self._get_log_headers(auth, payload is not None)
         http_logger.info(
             "REQUEST | method=%s url=%s headers=%s params=%s body=%s",
             method,
@@ -87,7 +119,13 @@ class OneCService:
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, auth=auth) as session:
-                async with session.request(method, url, params=params, json=payload) as response:
+                async with session.request(
+                    method,
+                    url,
+                    params=params,
+                    json=payload,
+                    headers=request_headers,
+                ) as response:
                     raw_body = await response.text()
                     http_logger.info(
                         "RESPONSE | method=%s url=%s status=%s body=%s",
@@ -127,24 +165,61 @@ class OneCService:
             )
             raise OneCServiceError("Не вдалося з'єднатися із сервісом замовлень.") from exc
 
-    async def check_auth(self, phone: str, code: str) -> bool:
+    @staticmethod
+    def _parse_success_response(response: Any) -> bool:
+        if isinstance(response, dict):
+            if "success" in response:
+                return bool(response.get("success"))
+
+            status_raw = str(response.get("status", "")).strip().lower()
+            if status_raw in {"success", "ok", "authorized", "linked"}:
+                return True
+
+            if "authorized" in response:
+                return bool(response.get("authorized"))
+        return False
+
+    @staticmethod
+    def _parse_auth_response(response: Any) -> bool:
+        if isinstance(response, dict) and "authorized" in response:
+            return bool(response.get("authorized"))
+        return OneCService._parse_success_response(response)
+
+    async def bind_telegram_user(self, phone: str, telegram_user_id: int) -> bool:
         masked_phone = f"***{phone[-4:]}" if len(phone) >= 4 else "***"
-        logger.info("1C auth check started for phone=%s", masked_phone)
+        logger.info("1C telegram bind started: user_id=%s phone=%s", telegram_user_id, masked_phone)
+        response = await self._request_json(
+            "POST",
+            "auth/link-telegram",
+            telegram_user_id=telegram_user_id,
+            payload={"phone": phone},
+        )
+        is_success = self._parse_success_response(response)
+        if is_success:
+            logger.info("1C telegram bind success: user_id=%s phone=%s", telegram_user_id, masked_phone)
+        else:
+            logger.warning("1C telegram bind rejected: user_id=%s phone=%s", telegram_user_id, masked_phone)
+        return is_success
+
+    async def check_auth(self, phone: str, code: str, telegram_user_id: int) -> bool:
+        masked_phone = f"***{phone[-4:]}" if len(phone) >= 4 else "***"
+        logger.info("1C auth check started for phone=%s user_id=%s", masked_phone, telegram_user_id)
         response = await self._request_json(
             "POST",
             "auth/check",
+            telegram_user_id=telegram_user_id,
             payload={"phone": phone, "code": code},
         )
-        is_authorized = bool(response.get("authorized"))
+        is_authorized = self._parse_auth_response(response)
         if is_authorized:
-            logger.info("1C auth check success for phone=%s", masked_phone)
+            logger.info("1C auth check success for phone=%s user_id=%s", masked_phone, telegram_user_id)
         else:
-            logger.warning("1C auth check failed for phone=%s", masked_phone)
+            logger.warning("1C auth check failed for phone=%s user_id=%s", masked_phone, telegram_user_id)
         return is_authorized
 
-    async def get_clients(self) -> list[Client]:
-        logger.info("Fetching clients from 1C endpoint")
-        response = await self._request_json("GET", "clients")
+    async def get_clients(self, telegram_user_id: int) -> list[Client]:
+        logger.info("Fetching clients from 1C endpoint for user_id=%s", telegram_user_id)
+        response = await self._request_json("GET", "clients", telegram_user_id=telegram_user_id)
         rows = response.get("clients", response if isinstance(response, list) else [])
         clients: list[Client] = []
         for row in rows:
@@ -156,16 +231,25 @@ class OneCService:
                 clients.append(Client(id=client_id, name=name))
         return clients
 
-    async def get_categories(self) -> list[str]:
-        logger.info("Fetching categories from 1C endpoint")
-        response = await self._request_json("GET", "categories")
+    async def get_categories(self, telegram_user_id: int) -> list[str]:
+        logger.info("Fetching categories from 1C endpoint for user_id=%s", telegram_user_id)
+        response = await self._request_json("GET", "categories", telegram_user_id=telegram_user_id)
         rows = response.get("categories", response if isinstance(response, list) else [])
         categories = [str(item).strip() for item in rows if str(item).strip()]
         return categories
 
-    async def get_products(self, category: str) -> list[Product]:
-        logger.info("Fetching products from 1C endpoint for category=%s", category)
-        response = await self._request_json("GET", "products", params={"category": category})
+    async def get_products(self, category: str, telegram_user_id: int) -> list[Product]:
+        logger.info(
+            "Fetching products from 1C endpoint for category=%s user_id=%s",
+            category,
+            telegram_user_id,
+        )
+        response = await self._request_json(
+            "GET",
+            "products",
+            telegram_user_id=telegram_user_id,
+            params={"category": category},
+        )
         rows = response.get("products", response if isinstance(response, list) else [])
         products: list[Product] = []
         for row in rows:
@@ -193,40 +277,55 @@ class OneCService:
             )
         return products
 
-    async def find_product(self, category: str, product_name: str) -> Product | None:
-        products = await self.get_products(category)
+    async def find_product(self, category: str, product_name: str, telegram_user_id: int) -> Product | None:
+        products = await self.get_products(category, telegram_user_id=telegram_user_id)
         for product in products:
             if product.name == product_name:
                 return product
         return None
 
-    async def get_trading_points(self, client_id: str) -> list[str]:
-        logger.info("Fetching trading points from 1C endpoint for client_id=%s", client_id)
-        response = await self._request_json("GET", "trading-points", params={"client_id": client_id})
+    async def get_trading_points(self, client_id: str, telegram_user_id: int) -> list[str]:
+        logger.info(
+            "Fetching trading points from 1C endpoint for client_id=%s user_id=%s",
+            client_id,
+            telegram_user_id,
+        )
+        response = await self._request_json(
+            "GET",
+            "trading-points",
+            telegram_user_id=telegram_user_id,
+            params={"client_id": client_id},
+        )
         rows = response.get("trading_points", response if isinstance(response, list) else [])
         return [str(item).strip() for item in rows if str(item).strip()]
 
-    async def create_order(self, order_data: dict[str, Any]) -> dict[str, Any]:
-        logger.info("Creating order in 1C endpoint")
-        response = await self._request_json("POST", "orders", payload=order_data)
+    async def create_order(self, order_data: dict[str, Any], telegram_user_id: int) -> dict[str, Any]:
+        logger.info("Creating order in 1C endpoint for user_id=%s", telegram_user_id)
+        response = await self._request_json(
+            "POST",
+            "orders",
+            telegram_user_id=telegram_user_id,
+            payload=order_data,
+        )
         order_number = str(response.get("order_number", "")).strip()
         if not order_number:
             raise OneCServiceError("Не вдалося отримати номер замовлення від сервісу.")
         return {"status": "success", "order_number": order_number}
 
-    async def check_base_url_status(self) -> tuple[bool, str]:
-        ok, _, message = await self.check_base_url_get()
+    async def check_base_url_status(self, telegram_user_id: int) -> tuple[bool, str]:
+        ok, _, message = await self.check_base_url_get(telegram_user_id=telegram_user_id)
         return ok, message
 
-    async def check_base_url_get(self) -> tuple[bool, int | None, str]:
+    async def check_base_url_get(self, telegram_user_id: int) -> tuple[bool, int | None, str]:
         url = self._build_url("")
         timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
+        auth = self._build_auth()
+        request_headers, log_headers = self._build_headers(
+            auth=auth,
+            telegram_user_id=telegram_user_id,
+            has_body=False,
+        )
 
-        auth: aiohttp.BasicAuth | None = None
-        if self.username and self.password:
-            auth = aiohttp.BasicAuth(self.username, self.password)
-
-        log_headers = self._get_log_headers(auth, has_body=False)
         http_logger.info(
             "REQUEST | method=%s url=%s headers=%s params=%s body=%s",
             "GET",
@@ -238,7 +337,7 @@ class OneCService:
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, auth=auth) as session:
-                async with session.get(url, allow_redirects=True) as response:
+                async with session.get(url, allow_redirects=True, headers=request_headers) as response:
                     body = await response.text()
                     status = response.status
                     http_logger.info(
