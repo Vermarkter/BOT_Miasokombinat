@@ -16,15 +16,26 @@ logger = logging.getLogger("backup_db")
 
 
 def _resolve_sqlite_path(database_url: str) -> Path:
-    prefix = "sqlite+aiosqlite:///"
-    if not database_url.startswith(prefix):
+    prefixes = (
+        "sqlite+aiosqlite:////",
+        "sqlite+aiosqlite:///",
+    )
+    if not database_url.startswith(prefixes):
         raise ValueError("DATABASE_URL must be sqlite+aiosqlite:///...")
 
-    raw_path = database_url[len(prefix) :]
+    raw_path = database_url
+    for prefix in prefixes:
+        if raw_path.startswith(prefix):
+            raw_path = raw_path[len(prefix) :]
+            break
+
+    # Handle file URIs and Windows absolute style like "/C:/path/file.db".
+    if raw_path.startswith("file:"):
+        raw_path = raw_path[5:]
+    if raw_path.startswith("/") and len(raw_path) >= 3 and raw_path[2] == ":":
+        raw_path = raw_path[1:]
     if raw_path.startswith("./"):
         return Path(raw_path[2:])
-    if raw_path.startswith("/"):
-        return Path(raw_path)
     return Path(raw_path)
 
 
