@@ -107,11 +107,15 @@ async def receive_phone_handler(message: Message, state: FSMContext) -> None:
         )
         return
 
-    logger.info("Phone received, requesting 1C auth: user_id=%s phone=%s", user_id, _mask_phone(phone))
+    phone_digits = "".join(ch for ch in phone if ch.isdigit())
+    logger.info("Phone received, requesting 1C auth: user_id=%s phone=%s", user_id, _mask_phone(phone_digits))
     try:
-        auth_agent = await one_c_service.authorize_agent(phone=phone, telegram_user_id=user_id)
-    except OneCServiceError:
+        auth_agent = await one_c_service.authorize_agent(phone=phone_digits, telegram_user_id=user_id)
+    except OneCServiceError as exc:
         logger.exception("1C auth request failed: user_id=%s", user_id)
+        if str(exc) == "Агента не знайдено в базі 1С":
+            await message.answer(str(exc), reply_markup=build_request_contact_keyboard())
+            return
         await message.answer(
             "Зараз не вдалося пройти авторизацію в 1С. Спробуйте ще раз трохи пізніше.",
             reply_markup=build_request_contact_keyboard(),

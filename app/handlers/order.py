@@ -8,19 +8,15 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from app.database import CartRepository, auth_storage
+from app.database import CartRepository, UserRepository, auth_storage
 from app.keyboards import (
     NEW_ORDER_BUTTON_TEXT,
     NO_COMMENT_BUTTON_TEXT,
     SHOW_CART_BUTTON_TEXT,
     build_cart_inline_keyboard,
-    build_delivery_dates_keyboard,
     build_main_keyboard,
     build_options_keyboard,
-    build_payment_methods_keyboard,
     build_skip_comment_keyboard,
-    get_nearest_delivery_dates,
-    get_payment_methods,
 )
 from app.services import OneCService, OneCServiceError
 from app.states import OrderStates
@@ -30,13 +26,18 @@ router = Router()
 logger = logging.getLogger(__name__)
 one_c_service = OneCService()
 cart_repository = CartRepository()
+user_repository = UserRepository()
 
-FINISH_ORDER_BUTTON_TEXT = "Перейти до доставки"
+FINISH_ORDER_BUTTON_TEXT = "Оформити замовлення"
+LAST_ORDERS_BUTTON_TEXT = "Останні замовлення"
+BACK_BUTTON_TEXT = "⬅️ Назад"
 CONFIRM_ORDER_BUTTON_TEXT = "Підтвердити замовлення"
-CANCEL_ORDER_BUTTON_TEXT = "Скасувати замовлення"
+CANCEL_ORDER_BUTTON_TEXT = "Скасувати"
+
 CART_DELETE_CALLBACK_PREFIX = "cart:delete:"
 CART_CLEAR_CALLBACK = "cart:clear"
 SUBMIT_COOLDOWN_SECONDS = 5.0
+
 _last_submit_attempts: dict[int, float] = {}
 _submit_locks: dict[int, asyncio.Lock] = {}
 
@@ -49,6 +50,53 @@ def _format_quantity(value: int | float) -> str:
 
 def _format_money(value: float) -> str:
     return f"{value:.2f}"
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if isinstance(value, str):
+            value = value.replace(",", ".")
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_quantity(value: float, unit: str) -> int | float:
+    if unit == "шт":
+        return int(round(value))
+    return float(value)
+
+
+def _service_unavailable_message(error: OneCServiceError | None = None) -> str:
+    if error is not None and str(error) == "Агента не знайдено в базі 1С":
+        return "Агента не знайдено в базі 1С"
+    return "Сервіс 1С тимчасово недоступний. Спробуйте ще раз трохи пізніше."
+
+
+def _build_cart_item(
+    *,
+    product_id: str,
+    product_name: str,
+    quantity: int | float,
+    unit: str,
+    price_per_unit: float,
+) -> dict[str, Any]:
+    line_total = float(quantity) * price_per_unit
+    return {
+        "product_id": product_id,
+        "product": product_name,
+        "quantity": quantity,
+        "unit": unit,
+        "price_per_unit": price_per_unit,
+        "line_total": line_total,
+    }
+
+
+def _find_cart_item(cart: list[dict[str, Any]], product_id: str) -> dict[str, Any] | None:
+    for item in cart:
+        if str(item.get("product_id", "")).strip() == product_id:
+            return item
+    return None
 
 
 def _format_cart_summary(cart: list[dict[str, Any]]) -> str:
@@ -87,9 +135,7 @@ def _build_order_summary(order_data: dict[str, Any]) -> str:
     lines = [
         "Підтвердження замовлення:",
         f"Клієнт: {order_data.get('selected_client', '-')}",
-        f"Торгова точка: {order_data.get('selected_trading_point', '-')}",
-        f"Дата доставки: {order_data.get('selected_delivery_date', '-')}",
-        f"Оплата: {order_data.get('selected_payment_method', '-')}",
+        f"Договір: {order_data.get('selected_contract', '-')}",
         f"Коментар: {order_data.get('comment', 'Без коментаря')}",
         "",
         "Позиції:",
@@ -104,79 +150,215 @@ def _build_order_summary(order_data: dict[str, Any]) -> str:
         if unit == "кг":
             total_weight_kg += quantity
 
-        quantity_str = _format_quantity(item.get("quantity", 0))
         lines.append(
-            f"{index}. {item.get('product', '-')}: {quantity_str} {unit} x "
+            f"{index}. {item.get('product', '-')}: {_format_quantity(item.get('quantity', 0))} {unit} x "
             f"{_format_money(price_per_unit)} грн = {_format_money(line_total)} грн",
         )
 
-    lines.extend(
-        [
-            "",
-            f"Загальна вага: {_format_money(total_weight_kg)} кг",
-            f"Загальна сума: {_format_money(total_sum)} грн",
-        ],
-    )
+    lines.append("")
+    lines.append(f"Загальна вага: {_format_money(total_weight_kg)} кг")
+    lines.append(f"Загальна сума: {_format_money(total_sum)} грн")
     return "\n".join(lines)
-
-
-def _to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if isinstance(value, str):
-            value = value.replace(",", ".")
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _build_create_order_payload(order_data: dict[str, Any]) -> dict[str, Any]:
     cart_raw = order_data.get("cart", [])
     cart = list(cart_raw) if isinstance(cart_raw, list) else []
 
-    items: list[dict[str, Any]] = []
+    products: list[dict[str, Any]] = []
     for raw_item in cart:
         if not isinstance(raw_item, dict):
             continue
-
-        product_id = str(
-            raw_item.get("product_id")
-            or raw_item.get("id")
-            or raw_item.get("product_uuid")
-            or ""
-        ).strip()
+        product_id = str(raw_item.get("product_id", "")).strip()
         if not product_id:
             continue
-
-        unit = str(raw_item.get("unit", "")).strip()
-        quantity_raw = _to_float(raw_item.get("quantity", 0), default=0.0)
-        quantity = _coerce_quantity(quantity_raw, unit)
-        price_per_unit = _to_float(
+        quantity = _coerce_quantity(_to_float(raw_item.get("quantity", 0), default=0.0), str(raw_item.get("unit", "")))
+        price = _to_float(
             raw_item.get("price_per_unit", raw_item.get("price", raw_item.get("unit_price", 0))),
             default=0.0,
         )
-        line_total = _to_float(raw_item.get("line_total"), default=float(quantity) * price_per_unit)
-
-        items.append(
+        products.append(
             {
                 "id": product_id,
-                "product_id": product_id,
-                "product_name": str(raw_item.get("product", raw_item.get("product_name", "Товар"))).strip(),
                 "quantity": quantity,
-                "unit": unit,
-                "price_per_unit": price_per_unit,
-                "line_total": line_total,
+                "price": price,
             },
         )
 
     return {
         "client_id": str(order_data.get("selected_client_id", "")).strip(),
-        "client_name": str(order_data.get("selected_client", "")).strip(),
-        "trading_point": str(order_data.get("selected_trading_point", "")).strip(),
-        "delivery_date": str(order_data.get("selected_delivery_date", "")).strip(),
-        "payment_method": str(order_data.get("selected_payment_method", "")).strip(),
-        "comment": order_data.get("comment"),
-        "items": items,
+        "contract_id": str(order_data.get("selected_contract_id", "")).strip(),
+        "products": products,
     }
+
+
+def _build_history_message(history_rows: list[dict[str, Any]], client_name: str) -> str:
+    if not history_rows:
+        return f"У клієнта «{client_name}» поки немає замовлень."
+
+    lines = [f"Останні замовлення клієнта «{client_name}»:"]
+    for index, row in enumerate(history_rows[:10], start=1):
+        number = str(row.get("order_number", "-")).strip() or "-"
+        date = str(row.get("date", "-")).strip() or "-"
+        total = _to_float(row.get("total", 0.0), default=0.0)
+        lines.append(f"{index}. №{number} | {date} | {_format_money(total)} грн")
+    return "\n".join(lines)
+
+
+def _build_labeled_map(
+    rows: list[dict[str, Any]],
+    *,
+    folder_key: str | None = None,
+    folder_prefix: str = "📁 ",
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    labels: list[str] = []
+    labeled_map: dict[str, dict[str, Any]] = {}
+
+    for row in rows:
+        name = str(row.get("name", "")).strip()
+        if not name:
+            continue
+
+        base_label = name
+        if folder_key and bool(row.get(folder_key)):
+            base_label = f"{folder_prefix}{name}"
+
+        final_label = base_label
+        duplicate_index = 2
+        while final_label in labeled_map:
+            final_label = f"{base_label} ({duplicate_index})"
+            duplicate_index += 1
+
+        labels.append(final_label)
+        labeled_map[final_label] = row
+
+    return labels, labeled_map
+
+
+def _serialize_clients(rows: list[Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        result.append(
+            {
+                "id": str(row.id),
+                "name": str(row.name),
+                "is_folder": bool(row.is_folder),
+            },
+        )
+    return result
+
+
+def _serialize_contracts(rows: list[Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        result.append(
+            {
+                "id": str(row.id),
+                "name": str(row.name),
+                "price_type_id": str(row.price_type_id),
+            },
+        )
+    return result
+
+
+def _serialize_products(rows: list[Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        result.append(
+            {
+                "id": str(row.id),
+                "name": str(row.name),
+                "is_folder": bool(row.is_folder),
+                "unit": str(row.unit),
+                "price": float(row.price),
+            },
+        )
+    return result
+
+
+def _serialize_history_rows(rows: list[Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        result.append(
+            {
+                "order_number": str(row.order_number),
+                "date": str(row.date),
+                "total": float(row.total),
+            },
+        )
+    return result
+
+
+def _build_cart_inline_rows(cart: list[dict[str, Any]]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for item in cart:
+        product_id = str(item.get("product_id", "")).strip()
+        if not product_id:
+            continue
+        quantity = _format_quantity(item.get("quantity", 0))
+        unit = str(item.get("unit", "")).strip()
+        line_total = float(item.get("line_total", 0))
+        rows.append(
+            {
+                "product_id": product_id,
+                "product_name": str(item.get("product", "-")).strip(),
+                "quantity": f"{quantity} {unit}".strip(),
+                "price": f"{_format_money(line_total)} грн",
+            },
+        )
+    return rows
+
+
+def _is_submit_flood(user_id: int) -> tuple[bool, int]:
+    now = time.monotonic()
+    last_attempt = _last_submit_attempts.get(user_id)
+    if last_attempt is not None:
+        elapsed = now - last_attempt
+        if elapsed < SUBMIT_COOLDOWN_SECONDS:
+            wait_seconds = int(SUBMIT_COOLDOWN_SECONDS - elapsed) + 1
+            return True, wait_seconds
+    _last_submit_attempts[user_id] = now
+    return False, 0
+
+
+def _get_submit_lock(user_id: int) -> asyncio.Lock:
+    lock = _submit_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _submit_locks[user_id] = lock
+    return lock
+
+
+async def _is_authorized_user(user_id: int) -> bool:
+    in_memory_status = auth_storage.get_user_authorization(user_id)
+    if in_memory_status == "Authorized":
+        return True
+
+    user = await user_repository.get_by_user_id(user_id)
+    if user is None:
+        return False
+    if bool(user.is_active) and bool((user.agent_id or "").strip()):
+        auth_storage.set_user_authorization(user_id, "Authorized")
+        return True
+    return False
+
+
+async def _resolve_agent_id(user_id: int, state: FSMContext) -> str | None:
+    data = await state.get_data()
+    state_agent_id = str(data.get("agent_id", "")).strip()
+    if state_agent_id:
+        return state_agent_id
+
+    user = await user_repository.get_by_user_id(user_id)
+    if user is None:
+        return None
+
+    agent_id = str(user.agent_id or "").strip()
+    if not agent_id:
+        return None
+
+    await state.update_data(agent_id=agent_id)
+    return agent_id
 
 
 async def _load_cart_from_db(user_id: int) -> list[dict[str, Any]]:
@@ -237,123 +419,128 @@ async def _update_cart_callback_message(callback: CallbackQuery, cart: list[dict
     )
 
 
-def _is_authorized(message: Message) -> bool:
-    if message.from_user is None:
-        return False
-    return auth_storage.get_user_authorization(message.from_user.id) == "Authorized"
+def _client_extra_buttons(data: dict[str, Any]) -> list[str]:
+    buttons: list[str] = []
+    history = data.get("client_parent_history")
+    if isinstance(history, list) and history:
+        buttons.append(BACK_BUTTON_TEXT)
+    buttons.append(SHOW_CART_BUTTON_TEXT)
+    return buttons
 
 
-def _service_unavailable_message() -> str:
-    return "Сервіс 1С тимчасово недоступний. Спробуйте ще раз трохи пізніше."
+def _contract_extra_buttons() -> list[str]:
+    return [LAST_ORDERS_BUTTON_TEXT, BACK_BUTTON_TEXT, SHOW_CART_BUTTON_TEXT]
 
 
-def _coerce_quantity(value: float, unit: str) -> int | float:
-    if unit == "шт":
-        return int(round(value))
-    return float(value)
-
-
-def _build_cart_item(
-    *,
-    product_id: str,
-    product_name: str,
-    quantity: int | float,
-    unit: str,
-    price_per_unit: float,
-    category: str | None = None,
-) -> dict[str, Any]:
-    line_total = float(quantity) * price_per_unit
-    return {
-        "product_id": product_id,
-        "category": category,
-        "product": product_name,
-        "quantity": quantity,
-        "unit": unit,
-        "price_per_unit": price_per_unit,
-        "line_total": line_total,
-    }
-
-
-def _find_cart_item(cart: list[dict[str, Any]], product_id: str) -> dict[str, Any] | None:
-    for item in cart:
-        if str(item.get("product_id", "")).strip() == product_id:
-            return item
-    return None
-
-
-def _upsert_cart_item_in_memory(
-    cart: list[dict[str, Any]],
-    *,
-    product_id: str,
-    product_name: str,
-    quantity: int | float,
-    unit: str,
-    price_per_unit: float,
-    category: str | None,
-) -> list[dict[str, Any]]:
-    updated_item = _build_cart_item(
-        product_id=product_id,
-        product_name=product_name,
-        quantity=quantity,
-        unit=unit,
-        price_per_unit=price_per_unit,
-        category=category,
-    )
-    for index, item in enumerate(cart):
-        if str(item.get("product_id", "")).strip() == product_id:
-            cart[index] = updated_item
-            return cart
-    cart.append(updated_item)
-    return cart
-
-
-def _category_extra_buttons(cart: list[dict[str, Any]]) -> list[str]:
-    extra_buttons = [SHOW_CART_BUTTON_TEXT]
+def _product_extra_buttons(cart: list[dict[str, Any]]) -> list[str]:
+    buttons = [BACK_BUTTON_TEXT, SHOW_CART_BUTTON_TEXT]
     if cart:
-        extra_buttons.insert(0, FINISH_ORDER_BUTTON_TEXT)
-    return extra_buttons
+        buttons.insert(0, FINISH_ORDER_BUTTON_TEXT)
+    return buttons
 
 
-def _build_cart_inline_rows(cart: list[dict[str, Any]]) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for item in cart:
-        product_id = str(item.get("product_id", "")).strip()
-        if not product_id:
-            continue
-
-        quantity = _format_quantity(item.get("quantity", 0))
-        unit = str(item.get("unit", "")).strip()
-        line_total = float(item.get("line_total", 0))
-        rows.append(
-            {
-                "product_id": product_id,
-                "product_name": str(item.get("product", "-")).strip(),
-                "quantity": f"{quantity} {unit}".strip(),
-                "price": f"{_format_money(line_total)} грн",
-            },
-        )
-    return rows
+async def _send_client_menu(message: Message, state: FSMContext, *, text: str | None = None) -> None:
+    data = await state.get_data()
+    labels = data.get("client_labels")
+    if not isinstance(labels, list):
+        labels = []
+    prompt = text or "Оберіть клієнта або папку:"
+    await message.answer(
+        prompt,
+        reply_markup=build_options_keyboard(labels, _client_extra_buttons(data)),
+    )
 
 
-def _is_submit_flood(user_id: int) -> tuple[bool, int]:
-    now = time.monotonic()
-    last_attempt = _last_submit_attempts.get(user_id)
-    if last_attempt is not None:
-        elapsed = now - last_attempt
-        if elapsed < SUBMIT_COOLDOWN_SECONDS:
-            wait_seconds = int(SUBMIT_COOLDOWN_SECONDS - elapsed) + 1
-            return True, wait_seconds
+async def _send_contract_menu(message: Message, state: FSMContext, *, text: str | None = None) -> None:
+    data = await state.get_data()
+    labels = data.get("contract_labels")
+    if not isinstance(labels, list):
+        labels = []
+    selected_client = str(data.get("selected_client", "-")).strip() or "-"
+    prompt = text or f"Клієнт: {selected_client}\nОберіть договір:"
+    await message.answer(
+        prompt,
+        reply_markup=build_options_keyboard(labels, _contract_extra_buttons()),
+    )
 
-    _last_submit_attempts[user_id] = now
-    return False, 0
+
+async def _send_product_menu(message: Message, state: FSMContext, *, text: str | None = None) -> None:
+    data = await state.get_data()
+    labels = data.get("product_labels")
+    if not isinstance(labels, list):
+        labels = []
+    cart_raw = data.get("cart", [])
+    cart = list(cart_raw) if isinstance(cart_raw, list) else []
+    prompt = text or "Оберіть папку або товар:"
+    await message.answer(
+        prompt,
+        reply_markup=build_options_keyboard(labels, _product_extra_buttons(cart)),
+    )
 
 
-def _get_submit_lock(user_id: int) -> asyncio.Lock:
-    lock = _submit_locks.get(user_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _submit_locks[user_id] = lock
-    return lock
+async def _fetch_clients_for_parent(
+    *,
+    user_id: int,
+    agent_id: str,
+    parent_id: str | None,
+) -> list[dict[str, Any]]:
+    clients = await one_c_service.get_clients(
+        agent_id=agent_id,
+        parent_id=parent_id,
+        telegram_user_id=user_id,
+    )
+    return _serialize_clients(clients)
+
+
+async def _set_client_scope(
+    state: FSMContext,
+    *,
+    parent_id: str | None,
+    parent_history: list[str | None],
+    rows: list[dict[str, Any]],
+) -> None:
+    labels, label_map = _build_labeled_map(rows, folder_key="is_folder")
+    await state.update_data(
+        client_parent_id=parent_id,
+        client_parent_history=parent_history,
+        current_clients=rows,
+        client_labels=labels,
+        client_label_map=label_map,
+    )
+
+
+async def _set_contract_scope(state: FSMContext, rows: list[dict[str, Any]]) -> None:
+    labels, label_map = _build_labeled_map(rows)
+    await state.update_data(
+        current_contracts=rows,
+        contract_labels=labels,
+        contract_label_map=label_map,
+    )
+
+
+async def _fetch_and_set_product_scope(
+    state: FSMContext,
+    *,
+    user_id: int,
+    price_type_id: str,
+    parent_id: str | None,
+    parent_history: list[str | None],
+) -> list[dict[str, Any]]:
+    products = await one_c_service.get_products(
+        price_type_id=price_type_id,
+        parent_id=parent_id,
+        telegram_user_id=user_id,
+    )
+    serialized = _serialize_products(products)
+    labels, label_map = _build_labeled_map(serialized, folder_key="is_folder")
+    await state.update_data(
+        product_parent_id=parent_id,
+        product_parent_history=parent_history,
+        current_products=serialized,
+        product_labels=labels,
+        product_label_map=label_map,
+    )
+    return serialized
 
 
 @router.message(Command("order"))
@@ -362,59 +549,66 @@ async def start_order_handler(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id if message.from_user else None
     logger.info("Order flow requested: user_id=%s", user_id)
 
-    if not _is_authorized(message):
+    if user_id is None:
+        await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
+        return
+    if not await _is_authorized_user(user_id):
         logger.warning("Unauthorized user tried to start order flow: user_id=%s", user_id)
-        await message.answer("Спочатку авторизуйтесь через /start.")
+        await message.answer("Спочатку авторизуйтеся через /start.")
+        return
+
+    agent_id = await _resolve_agent_id(user_id, state)
+    if not agent_id:
+        await message.answer("Не знайдено дані агента. Пройдіть авторизацію через /start ще раз.")
         return
 
     try:
-        clients = await one_c_service.get_clients(telegram_user_id=int(user_id or 0))
-    except OneCServiceError:
+        current_clients = await _fetch_clients_for_parent(user_id=user_id, agent_id=agent_id, parent_id=None)
+    except OneCServiceError as exc:
         logger.exception("Failed to fetch clients: user_id=%s", user_id)
-        await message.answer(_service_unavailable_message())
+        await message.answer(_service_unavailable_message(exc))
         return
 
-    if not clients:
-        logger.error("No clients available from 1C")
-        await message.answer("Список клієнтів недоступний. Спробуйте пізніше.")
+    if not current_clients:
+        await message.answer("Список клієнтів порожній. Спробуйте пізніше.")
         return
 
     restored_cart: list[dict[str, Any]] = []
-    if user_id is not None:
-        try:
-            restored_cart = await _load_cart_from_db(user_id)
-        except Exception:
-            logger.exception("Failed to restore cart from DB: user_id=%s", user_id)
+    try:
+        restored_cart = await _load_cart_from_db(user_id)
+    except Exception:
+        logger.exception("Failed to restore cart from DB: user_id=%s", user_id)
 
-    client_map = {client.name: client.id for client in clients}
     await state.set_state(OrderStates.waiting_for_client)
     await state.update_data(
+        agent_id=agent_id,
         cart=restored_cart,
-        available_clients=list(client_map.keys()),
-        client_map=client_map,
         selected_client=None,
         selected_client_id=None,
-        selected_category=None,
+        selected_contract=None,
+        selected_contract_id=None,
+        selected_price_type_id=None,
         selected_product=None,
         selected_product_id=None,
         selected_unit=None,
         selected_price_per_unit=None,
-        selected_trading_point=None,
-        selected_delivery_date=None,
-        selected_payment_method=None,
-        comment=None,
         awaiting_order_confirmation=False,
         order_submission_in_progress=False,
+        comment=None,
         updating_existing_item=False,
+        product_parent_id=None,
+        product_parent_history=[],
     )
-    logger.info("Order state set waiting_for_client: user_id=%s", user_id)
+    await _set_client_scope(
+        state,
+        parent_id=None,
+        parent_history=[],
+        rows=current_clients,
+    )
 
     if restored_cart:
-        await message.answer(
-            "Знайдено незавершений кошик. Ви можете переглянути його кнопкою «Мій кошик».",
-        )
-
-    await message.answer("Оберіть клієнта:", reply_markup=build_options_keyboard(list(client_map.keys())))
+        await message.answer("Знайдено незавершений кошик. За потреби відкрийте його кнопкою «Мій кошик».")
+    await _send_client_menu(message, state)
 
 
 @router.message(Command("cart"))
@@ -423,12 +617,11 @@ async def show_cart_handler(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id if message.from_user else None
     logger.info("Cart preview requested: user_id=%s", user_id)
 
-    if not _is_authorized(message):
-        await message.answer("Спочатку авторизуйтесь через /start.")
-        return
-
     if user_id is None:
         await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
+        return
+    if not await _is_authorized_user(user_id):
+        await message.answer("Спочатку авторизуйтеся через /start.")
         return
 
     await _send_cart_preview(message, state, user_id)
@@ -481,258 +674,334 @@ async def cart_clear_callback_handler(callback: CallbackQuery, state: FSMContext
 @router.message(OrderStates.waiting_for_client)
 async def order_client_handler(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id if message.from_user else None
-    selected_client = (message.text or "").strip()
+    user_value = (message.text or "").strip()
+    if user_id is None:
+        await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
+        return
+
     data = await state.get_data()
+    agent_id = str(data.get("agent_id", "")).strip()
+    if not agent_id:
+        agent_id = await _resolve_agent_id(user_id, state) or ""
+    if not agent_id:
+        await message.answer("Не знайдено дані агента. Пройдіть авторизацію через /start ще раз.")
+        return
 
-    clients = data.get("available_clients")
-    if not isinstance(clients, list):
-        try:
-            clients = [
-                client.name
-                for client in await one_c_service.get_clients(telegram_user_id=int(user_id or 0))
-            ]
-        except OneCServiceError:
-            logger.exception("Failed to refresh clients: user_id=%s", user_id)
-            await message.answer(_service_unavailable_message())
+    if user_value == SHOW_CART_BUTTON_TEXT:
+        await _send_cart_preview(message, state, user_id)
+        await _send_client_menu(message, state)
+        return
+
+    if user_value == BACK_BUTTON_TEXT:
+        history_raw = data.get("client_parent_history", [])
+        history = list(history_raw) if isinstance(history_raw, list) else []
+        if not history:
+            await message.answer("Ви вже в кореневій папці клієнтів.")
+            await _send_client_menu(message, state)
             return
-        await state.update_data(available_clients=clients)
 
-    if selected_client not in clients:
-        logger.info("Unknown client input: user_id=%s value=%s", user_id, selected_client)
-        await message.answer(
-            "Оберіть клієнта з кнопок нижче.",
-            reply_markup=build_options_keyboard(clients),
+        previous_parent = history.pop()
+        try:
+            rows = await _fetch_clients_for_parent(
+                user_id=user_id,
+                agent_id=agent_id,
+                parent_id=previous_parent,
+            )
+        except OneCServiceError as exc:
+            logger.exception("Failed to fetch previous clients folder: user_id=%s", user_id)
+            await message.answer(_service_unavailable_message(exc))
+            return
+
+        await _set_client_scope(
+            state,
+            parent_id=previous_parent,
+            parent_history=history,
+            rows=rows,
         )
+        await _send_client_menu(message, state)
         return
 
-    client_map = data.get("client_map")
-    if not isinstance(client_map, dict):
+    client_label_map = data.get("client_label_map")
+    if not isinstance(client_label_map, dict) or user_value not in client_label_map:
+        await message.answer("Оберіть клієнта або папку з кнопок нижче.")
+        await _send_client_menu(message, state)
+        return
+
+    selected_row = client_label_map[user_value]
+    if bool(selected_row.get("is_folder")):
+        current_parent = data.get("client_parent_id")
+        history_raw = data.get("client_parent_history", [])
+        history = list(history_raw) if isinstance(history_raw, list) else []
+        history.append(current_parent if isinstance(current_parent, str) else None)
+        new_parent_id = str(selected_row.get("id", "")).strip()
+
         try:
-            client_map = {
-                client.name: client.id
-                for client in await one_c_service.get_clients(telegram_user_id=int(user_id or 0))
-            }
-        except OneCServiceError:
-            logger.exception("Failed to refresh client map: user_id=%s", user_id)
-            await message.answer(_service_unavailable_message())
+            rows = await _fetch_clients_for_parent(
+                user_id=user_id,
+                agent_id=agent_id,
+                parent_id=new_parent_id,
+            )
+        except OneCServiceError as exc:
+            logger.exception("Failed to fetch nested clients folder: user_id=%s", user_id)
+            await message.answer(_service_unavailable_message(exc))
             return
-        await state.update_data(client_map=client_map)
 
-    selected_client_id = client_map.get(selected_client)
-    if not isinstance(selected_client_id, str):
-        logger.warning("Client id not found: user_id=%s client=%s", user_id, selected_client)
-        await message.answer("Не вдалося визначити клієнта. Оберіть клієнта ще раз.")
+        if not rows:
+            await message.answer("У цій папці поки немає клієнтів.")
+            await _send_client_menu(message, state)
+            return
+
+        await _set_client_scope(
+            state,
+            parent_id=new_parent_id,
+            parent_history=history,
+            rows=rows,
+        )
+        await _send_client_menu(message, state, text=f"Папка: {selected_row.get('name', '-')}\nОберіть клієнта або папку:")
         return
 
+    selected_client_id = str(selected_row.get("id", "")).strip()
+    selected_client_name = str(selected_row.get("name", "")).strip() or "Клієнт"
     try:
-        categories = await one_c_service.get_categories(telegram_user_id=int(user_id or 0))
-    except OneCServiceError:
-        logger.exception("Failed to fetch categories: user_id=%s", user_id)
-        await message.answer(_service_unavailable_message())
+        contracts = await one_c_service.get_contracts(
+            client_id=selected_client_id,
+            telegram_user_id=user_id,
+        )
+    except OneCServiceError as exc:
+        logger.exception("Failed to fetch contracts: user_id=%s client_id=%s", user_id, selected_client_id)
+        await message.answer(_service_unavailable_message(exc))
         return
 
-    cart_raw = data.get("cart", [])
-    cart = list(cart_raw) if isinstance(cart_raw, list) else []
-
-    await state.set_state(OrderStates.waiting_for_category)
+    serialized_contracts = _serialize_contracts(contracts)
+    await state.set_state(OrderStates.waiting_for_contract)
     await state.update_data(
-        selected_client=selected_client,
+        selected_client=selected_client_name,
         selected_client_id=selected_client_id,
-        available_categories=categories,
+        selected_contract=None,
+        selected_contract_id=None,
+        selected_price_type_id=None,
+        product_parent_id=None,
+        product_parent_history=[],
+        current_products=[],
+        product_labels=[],
+        product_label_map={},
+        awaiting_order_confirmation=False,
+        order_submission_in_progress=False,
+        comment=None,
     )
-    logger.info("Client selected: user_id=%s client=%s", user_id, selected_client)
-    await message.answer(
-        f"Клієнт: {selected_client}\nОберіть категорію товару:",
-        reply_markup=build_options_keyboard(categories, _category_extra_buttons(cart)),
-    )
+    await _set_contract_scope(state, serialized_contracts)
+    if not serialized_contracts:
+        await _send_contract_menu(
+            message,
+            state,
+            text=(
+                f"Клієнт: {selected_client_name}\n"
+                "Для цього клієнта не знайдено договорів. "
+                "Можете переглянути останні замовлення або повернутися назад."
+            ),
+        )
+        return
+
+    await _send_contract_menu(message, state, text=f"Клієнт: {selected_client_name}\nОберіть договір:")
 
 
-@router.message(OrderStates.waiting_for_category)
-async def order_category_handler(message: Message, state: FSMContext) -> None:
+@router.message(OrderStates.waiting_for_contract)
+async def order_contract_handler(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id if message.from_user else None
-    selected_category = (message.text or "").strip()
+    user_value = (message.text or "").strip()
+    if user_id is None:
+        await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
+        return
+
     data = await state.get_data()
-    cart_raw = data.get("cart", [])
-    cart = list(cart_raw) if isinstance(cart_raw, list) else []
+    selected_client_id = str(data.get("selected_client_id", "")).strip()
+    selected_client_name = str(data.get("selected_client", "Клієнт")).strip() or "Клієнт"
 
-    categories = data.get("available_categories")
-    if not isinstance(categories, list):
-        try:
-            categories = await one_c_service.get_categories(telegram_user_id=int(user_id or 0))
-        except OneCServiceError:
-            logger.exception("Failed to refresh categories: user_id=%s", user_id)
-            await message.answer(_service_unavailable_message())
-            return
-        await state.update_data(available_categories=categories)
-
-    if selected_category == SHOW_CART_BUTTON_TEXT:
-        if user_id is not None:
-            await _send_cart_preview(message, state, user_id)
-        else:
-            await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
-
-        refreshed_data = await state.get_data()
-        refreshed_cart_raw = refreshed_data.get("cart", [])
-        refreshed_cart = list(refreshed_cart_raw) if isinstance(refreshed_cart_raw, list) else []
-        await message.answer(
-            "Оберіть категорію товару:",
-            reply_markup=build_options_keyboard(categories, _category_extra_buttons(refreshed_cart)),
-        )
+    if user_value == SHOW_CART_BUTTON_TEXT:
+        await _send_cart_preview(message, state, user_id)
+        await _send_contract_menu(message, state)
         return
 
-    if selected_category == FINISH_ORDER_BUTTON_TEXT:
-        if not cart:
-            logger.info("Finish requested with empty cart: user_id=%s", user_id)
-            await message.answer(
-                "Кошик порожній. Додайте хоча б один товар.",
-                reply_markup=build_options_keyboard(categories, _category_extra_buttons(cart)),
-            )
-            return
-
-        selected_client_id = str(data.get("selected_client_id", "")).strip()
-        try:
-            trading_points = await one_c_service.get_trading_points(
-                selected_client_id,
-                telegram_user_id=int(user_id or 0),
-            )
-        except OneCServiceError:
-            logger.exception("Failed to fetch trading points: user_id=%s client_id=%s", user_id, selected_client_id)
-            await message.answer(_service_unavailable_message())
-            return
-
-        if not trading_points:
-            logger.warning("No trading points for client: user_id=%s client_id=%s", user_id, selected_client_id)
-            await message.answer("Для цього клієнта не знайдено торгових точок.")
-            return
-
-        await state.set_state(OrderStates.waiting_for_trading_point)
-        await state.update_data(available_trading_points=trading_points)
-        logger.info(
-            "Switching to trading point selection: user_id=%s client_id=%s",
-            user_id,
-            selected_client_id,
-        )
-        await message.answer(
-            "Оберіть торгову точку:",
-            reply_markup=build_options_keyboard(trading_points),
-        )
+    if user_value == BACK_BUTTON_TEXT:
+        await state.set_state(OrderStates.waiting_for_client)
+        await _send_client_menu(message, state, text="Оберіть клієнта або папку:")
         return
 
-    if selected_category not in categories:
-        logger.info("Unknown category input: user_id=%s value=%s", user_id, selected_category)
-        await message.answer(
-            "Оберіть категорію з кнопок нижче.",
-            reply_markup=build_options_keyboard(categories, _category_extra_buttons(cart)),
-        )
+    if user_value == LAST_ORDERS_BUTTON_TEXT:
+        if not selected_client_id:
+            await message.answer("Спочатку оберіть клієнта.")
+            return
+        try:
+            history = await one_c_service.get_orders_history(
+                client_id=selected_client_id,
+                telegram_user_id=user_id,
+            )
+        except OneCServiceError as exc:
+            logger.exception("Failed to fetch order history: user_id=%s client_id=%s", user_id, selected_client_id)
+            await message.answer(_service_unavailable_message(exc))
+            return
+
+        history_rows = _serialize_history_rows(history)
+        await message.answer(_build_history_message(history_rows, selected_client_name))
+        await _send_contract_menu(message, state)
+        return
+
+    contract_label_map = data.get("contract_label_map")
+    if not isinstance(contract_label_map, dict) or user_value not in contract_label_map:
+        await message.answer("Оберіть договір з кнопок нижче.")
+        await _send_contract_menu(message, state)
+        return
+
+    selected_contract_row = contract_label_map[user_value]
+    selected_contract_id = str(selected_contract_row.get("id", "")).strip()
+    selected_contract_name = str(selected_contract_row.get("name", "")).strip() or "Договір"
+    selected_price_type_id = str(selected_contract_row.get("price_type_id", "")).strip()
+
+    if not selected_contract_id or not selected_price_type_id:
+        await message.answer("Не вдалося прочитати дані договору. Оберіть інший договір.")
+        await _send_contract_menu(message, state)
         return
 
     try:
-        products = await one_c_service.get_products(selected_category, telegram_user_id=int(user_id or 0))
-    except OneCServiceError:
-        logger.exception("Failed to fetch products: user_id=%s category=%s", user_id, selected_category)
-        await message.answer(_service_unavailable_message())
-        return
-
-    product_names = [product.name for product in products]
-    if not product_names:
-        logger.warning("No products for category: user_id=%s category=%s", user_id, selected_category)
-        await message.answer(
-            "У цій категорії поки немає товарів. Оберіть іншу.",
-            reply_markup=build_options_keyboard(categories, _category_extra_buttons(cart)),
+        products = await _fetch_and_set_product_scope(
+            state,
+            user_id=user_id,
+            price_type_id=selected_price_type_id,
+            parent_id=None,
+            parent_history=[],
         )
+    except OneCServiceError as exc:
+        logger.exception("Failed to fetch root products: user_id=%s", user_id)
+        await message.answer(_service_unavailable_message(exc))
         return
 
-    products_map = {
-        product.name: {
-            "product_id": product.id,
-            "unit": product.unit,
-            "price_per_unit": product.price_per_unit,
-        }
-        for product in products
-    }
     await state.set_state(OrderStates.waiting_for_product)
     await state.update_data(
-        selected_category=selected_category,
-        available_products=product_names,
-        products_map=products_map,
+        selected_contract=selected_contract_name,
+        selected_contract_id=selected_contract_id,
+        selected_price_type_id=selected_price_type_id,
+        selected_product=None,
+        selected_product_id=None,
+        selected_unit=None,
+        selected_price_per_unit=None,
+        updating_existing_item=False,
     )
-    logger.info("Category selected: user_id=%s category=%s", user_id, selected_category)
-    await message.answer(
-        "Оберіть товар:",
-        reply_markup=build_options_keyboard(product_names),
+
+    if not products:
+        await message.answer("Каталог товарів порожній для цього договору.")
+        await _send_product_menu(message, state)
+        return
+
+    await _send_product_menu(
+        message,
+        state,
+        text=f"Договір: {selected_contract_name}\nОберіть папку або товар:",
     )
 
 
 @router.message(OrderStates.waiting_for_product)
 async def order_product_handler(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id if message.from_user else None
-    selected_product = (message.text or "").strip()
+    user_value = (message.text or "").strip()
+    if user_id is None:
+        await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
+        return
+
     data = await state.get_data()
-    selected_category = str(data.get("selected_category", "")).strip()
+    selected_price_type_id = str(data.get("selected_price_type_id", "")).strip()
+    if not selected_price_type_id:
+        await state.set_state(OrderStates.waiting_for_contract)
+        await _send_contract_menu(message, state, text="Оберіть договір для роботи з каталогом.")
+        return
 
-    available_products = data.get("available_products")
-    if not isinstance(available_products, list):
-        try:
-            available_products = [
-                p.name
-                for p in await one_c_service.get_products(
-                    selected_category,
-                    telegram_user_id=int(user_id or 0),
+    if user_value == SHOW_CART_BUTTON_TEXT:
+        await _send_cart_preview(message, state, user_id)
+        await _send_product_menu(message, state)
+        return
+
+    if user_value == BACK_BUTTON_TEXT:
+        history_raw = data.get("product_parent_history", [])
+        history = list(history_raw) if isinstance(history_raw, list) else []
+        if history:
+            previous_parent = history.pop()
+            try:
+                await _fetch_and_set_product_scope(
+                    state,
+                    user_id=user_id,
+                    price_type_id=selected_price_type_id,
+                    parent_id=previous_parent if isinstance(previous_parent, str) else None,
+                    parent_history=history,
                 )
-            ]
-        except OneCServiceError:
-            logger.exception("Failed to refresh products: user_id=%s category=%s", user_id, selected_category)
-            await message.answer(_service_unavailable_message())
+            except OneCServiceError as exc:
+                logger.exception("Failed to fetch previous product folder: user_id=%s", user_id)
+                await message.answer(_service_unavailable_message(exc))
+                return
+            await _send_product_menu(message, state)
             return
-        await state.update_data(available_products=available_products)
 
-    if selected_product not in available_products:
-        logger.info("Unknown product input: user_id=%s value=%s", user_id, selected_product)
+        await state.set_state(OrderStates.waiting_for_contract)
+        await _send_contract_menu(message, state, text="Оберіть договір:")
+        return
+
+    if user_value == FINISH_ORDER_BUTTON_TEXT:
+        cart_raw = data.get("cart", [])
+        cart = list(cart_raw) if isinstance(cart_raw, list) else []
+        if not cart:
+            await message.answer("Кошик порожній. Додайте хоча б один товар.")
+            await _send_product_menu(message, state)
+            return
+
+        await state.set_state(OrderStates.waiting_for_comment)
+        await state.update_data(
+            awaiting_order_confirmation=False,
+            order_submission_in_progress=False,
+            comment=None,
+        )
         await message.answer(
-            "Оберіть товар з кнопок нижче.",
-            reply_markup=build_options_keyboard(available_products),
+            "Введіть коментар до замовлення або натисніть «Без коментаря».",
+            reply_markup=build_skip_comment_keyboard(),
         )
         return
 
-    products_map = data.get("products_map")
-    if not isinstance(products_map, dict):
-        products_map = {}
+    product_label_map = data.get("product_label_map")
+    if not isinstance(product_label_map, dict) or user_value not in product_label_map:
+        await message.answer("Оберіть товар або папку з кнопок нижче.")
+        await _send_product_menu(message, state)
+        return
 
-    product_data = products_map.get(selected_product)
-    if not isinstance(product_data, dict):
+    selected_row = product_label_map[user_value]
+    if bool(selected_row.get("is_folder")):
+        current_parent = data.get("product_parent_id")
+        history_raw = data.get("product_parent_history", [])
+        history = list(history_raw) if isinstance(history_raw, list) else []
+        history.append(current_parent if isinstance(current_parent, str) else None)
+        new_parent_id = str(selected_row.get("id", "")).strip()
+
         try:
-            product = await one_c_service.find_product(
-                selected_category,
-                selected_product,
-                telegram_user_id=int(user_id or 0),
+            products = await _fetch_and_set_product_scope(
+                state,
+                user_id=user_id,
+                price_type_id=selected_price_type_id,
+                parent_id=new_parent_id,
+                parent_history=history,
             )
-        except OneCServiceError:
-            logger.exception(
-                "Failed to find product in 1C: user_id=%s category=%s product=%s",
-                user_id,
-                selected_category,
-                selected_product,
-            )
-            await message.answer(_service_unavailable_message())
+        except OneCServiceError as exc:
+            logger.exception("Failed to fetch nested products folder: user_id=%s", user_id)
+            await message.answer(_service_unavailable_message(exc))
             return
-        if product is None:
-            logger.warning(
-                "Product not found in catalog after selection: user_id=%s category=%s product=%s",
-                user_id,
-                selected_category,
-                selected_product,
-            )
-            await message.answer("Не вдалося знайти товар. Оберіть товар ще раз.")
-            return
-        product_data = {
-            "product_id": product.id,
-            "unit": product.unit,
-            "price_per_unit": product.price_per_unit,
-        }
 
-    selected_product_id = str(product_data.get("product_id", selected_product)).strip() or selected_product
-    selected_unit = str(product_data.get("unit", "")).strip()
-    selected_price_per_unit = float(product_data.get("price_per_unit", 0))
+        if not products:
+            await message.answer("У цій папці поки немає товарів.")
+            await _send_product_menu(message, state)
+            return
+
+        await _send_product_menu(message, state, text=f"Папка: {selected_row.get('name', '-')}\nОберіть товар або папку:")
+        return
+
+    selected_product_name = str(selected_row.get("name", "")).strip() or "Товар"
+    selected_product_id = str(selected_row.get("id", "")).strip()
+    selected_unit = str(selected_row.get("unit", "")).strip() or "шт"
+    selected_price = _to_float(selected_row.get("price", 0), default=0.0)
 
     cart_raw = data.get("cart", [])
     cart = list(cart_raw) if isinstance(cart_raw, list) else []
@@ -740,229 +1009,106 @@ async def order_product_handler(message: Message, state: FSMContext) -> None:
 
     await state.set_state(OrderStates.waiting_for_quantity)
     await state.update_data(
-        selected_product=selected_product,
+        selected_product=selected_product_name,
         selected_product_id=selected_product_id,
         selected_unit=selected_unit,
-        selected_price_per_unit=selected_price_per_unit,
+        selected_price_per_unit=selected_price,
         updating_existing_item=existing_item is not None,
-    )
-    logger.info(
-        "Product selected: user_id=%s category=%s product=%s product_id=%s unit=%s price=%.2f",
-        user_id,
-        selected_category,
-        selected_product,
-        selected_product_id,
-        selected_unit,
-        selected_price_per_unit,
     )
 
     if existing_item is not None:
         await message.answer(
-            f"Товар «{selected_product}» вже є в кошику: "
+            f"Товар «{selected_product_name}» вже у кошику: "
             f"{_format_quantity(existing_item.get('quantity', 0))} {selected_unit}.\n"
-            "Введіть нову кількість, щоб оновити цю позицію.",
+            "Введіть нову кількість, щоб оновити позицію.",
         )
         return
 
-    await message.answer(f"Введіть кількість для «{selected_product}» ({selected_unit}).")
+    await message.answer(f"Введіть кількість для «{selected_product_name}» ({selected_unit}).")
 
 
 @router.message(OrderStates.waiting_for_quantity)
 async def order_quantity_handler(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id if message.from_user else None
     raw_quantity = (message.text or "").strip()
-    data = await state.get_data()
+    if user_id is None:
+        await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
+        return
 
-    selected_category = str(data.get("selected_category", "")).strip()
+    data = await state.get_data()
     selected_product = str(data.get("selected_product", "")).strip()
-    selected_product_id = str(data.get("selected_product_id", selected_product)).strip() or selected_product
+    selected_product_id = str(data.get("selected_product_id", "")).strip()
     selected_unit = str(data.get("selected_unit", "")).strip()
-    selected_price_per_unit = float(data.get("selected_price_per_unit", 0))
+    selected_price_per_unit = _to_float(data.get("selected_price_per_unit", 0), default=0.0)
+    selected_price_type_id = str(data.get("selected_price_type_id", "")).strip()
+    current_parent_id = data.get("product_parent_id")
+    parent_id = current_parent_id if isinstance(current_parent_id, str) else None
+    parent_history_raw = data.get("product_parent_history", [])
+    parent_history = list(parent_history_raw) if isinstance(parent_history_raw, list) else []
     is_update = bool(data.get("updating_existing_item"))
-    cart_raw = data.get("cart", [])
-    cart = list(cart_raw) if isinstance(cart_raw, list) else []
 
     try:
         quantity = validate_quantity(raw_quantity, selected_unit)
     except QuantityValidationError as exc:
-        logger.info(
-            "Quantity validation failed: user_id=%s product=%s unit=%s raw=%s error=%s",
-            user_id,
-            selected_product,
-            selected_unit,
-            raw_quantity,
-            str(exc),
-        )
         await message.answer(str(exc))
         return
 
-    if user_id is not None:
-        try:
-            await cart_repository.upsert_item(
-                user_id=user_id,
-                product_id=selected_product_id,
-                product_name=selected_product,
-                quantity=float(quantity),
-                price=selected_price_per_unit,
-                unit=selected_unit,
-            )
-            cart = await _load_cart_from_db(user_id)
-        except Exception:
-            logger.exception(
-                "Failed to upsert cart item in DB: user_id=%s product_id=%s",
-                user_id,
-                selected_product_id,
-            )
-            await message.answer("Не вдалося зберегти товар у кошик. Спробуйте ще раз.")
-            return
-    else:
-        cart = _upsert_cart_item_in_memory(
-            cart,
+    try:
+        await cart_repository.upsert_item(
+            user_id=user_id,
             product_id=selected_product_id,
             product_name=selected_product,
-            quantity=quantity,
+            quantity=float(quantity),
+            price=selected_price_per_unit,
             unit=selected_unit,
-            price_per_unit=selected_price_per_unit,
-            category=selected_category,
         )
-
-    logger.info(
-        "Cart item upserted: user_id=%s product=%s product_id=%s quantity=%s unit=%s",
-        user_id,
-        selected_product,
-        selected_product_id,
-        _format_quantity(quantity),
-        selected_unit,
-    )
-
-    try:
-        categories = await one_c_service.get_categories(telegram_user_id=int(user_id or 0))
-    except OneCServiceError:
-        logger.exception("Failed to fetch categories after item upsert: user_id=%s", user_id)
-        await message.answer(_service_unavailable_message())
+        cart = await _load_cart_from_db(user_id)
+    except Exception:
+        logger.exception(
+            "Failed to upsert cart item in DB: user_id=%s product_id=%s",
+            user_id,
+            selected_product_id,
+        )
+        await message.answer("Не вдалося зберегти товар у кошик. Спробуйте ще раз.")
         return
 
-    await state.set_state(OrderStates.waiting_for_category)
+    if not selected_price_type_id:
+        await message.answer("Не знайдено тип цін для каталогу. Поверніться до вибору договору.")
+        await state.set_state(OrderStates.waiting_for_contract)
+        await _send_contract_menu(message, state)
+        return
+
+    try:
+        await _fetch_and_set_product_scope(
+            state,
+            user_id=user_id,
+            price_type_id=selected_price_type_id,
+            parent_id=parent_id,
+            parent_history=parent_history,
+        )
+    except OneCServiceError as exc:
+        logger.exception("Failed to refresh product scope after quantity input: user_id=%s", user_id)
+        await message.answer(_service_unavailable_message(exc))
+        return
+
+    await state.set_state(OrderStates.waiting_for_product)
     await state.update_data(
         cart=cart,
-        available_categories=categories,
         selected_product=None,
         selected_product_id=None,
         selected_unit=None,
         selected_price_per_unit=None,
-        products_map={},
         updating_existing_item=False,
     )
 
     action_text = "Кількість оновлено в кошику." if is_update else "Товар додано в кошик."
-    await message.answer(
-        f"{action_text}\n{_format_cart_summary(cart)}\n"
-        f"Оберіть наступну категорію, «{SHOW_CART_BUTTON_TEXT}» або «{FINISH_ORDER_BUTTON_TEXT}».",
-        reply_markup=build_options_keyboard(categories, _category_extra_buttons(cart)),
-    )
-
-
-@router.message(OrderStates.waiting_for_trading_point)
-async def order_trading_point_handler(message: Message, state: FSMContext) -> None:
-    user_id = message.from_user.id if message.from_user else None
-    selected_trading_point = (message.text or "").strip()
-    data = await state.get_data()
-    trading_points = data.get("available_trading_points")
-    if not isinstance(trading_points, list):
-        trading_points = []
-
-    if selected_trading_point not in trading_points:
-        logger.info("Unknown trading point input: user_id=%s value=%s", user_id, selected_trading_point)
-        await message.answer(
-            "Оберіть торгову точку з кнопок нижче.",
-            reply_markup=build_options_keyboard(trading_points),
-        )
-        return
-
-    delivery_dates = get_nearest_delivery_dates()
-    await state.set_state(OrderStates.waiting_for_delivery_date)
-    await state.update_data(
-        selected_trading_point=selected_trading_point,
-        available_delivery_dates=delivery_dates,
-        selected_delivery_date=None,
-        selected_payment_method=None,
-        comment=None,
-        awaiting_order_confirmation=False,
-        order_submission_in_progress=False,
-    )
-    logger.info("Trading point selected: user_id=%s point=%s", user_id, selected_trading_point)
-    await message.answer(
-        "Оберіть дату доставки:",
-        reply_markup=build_delivery_dates_keyboard(),
-    )
-
-
-@router.message(OrderStates.waiting_for_delivery_date)
-async def order_delivery_date_handler(message: Message, state: FSMContext) -> None:
-    user_id = message.from_user.id if message.from_user else None
-    user_value = (message.text or "").strip()
-    data = await state.get_data()
-
-    delivery_dates = data.get("available_delivery_dates")
-    if not isinstance(delivery_dates, list):
-        delivery_dates = get_nearest_delivery_dates()
-        await state.update_data(available_delivery_dates=delivery_dates)
-
-    if user_value not in delivery_dates:
-        logger.info("Unknown delivery date input: user_id=%s value=%s", user_id, user_value)
-        await message.answer(
-            "Оберіть дату доставки з кнопок нижче.",
-            reply_markup=build_delivery_dates_keyboard(),
-        )
-        return
-
-    await state.set_state(OrderStates.waiting_for_payment_method)
-    await state.update_data(
-        selected_delivery_date=user_value,
-        available_payment_methods=get_payment_methods(),
-        selected_payment_method=None,
-    )
-    logger.info("Delivery date selected: user_id=%s date=%s", user_id, user_value)
-    await message.answer(
-        "Оберіть спосіб оплати:",
-        reply_markup=build_payment_methods_keyboard(),
-    )
-
-
-@router.message(OrderStates.waiting_for_payment_method)
-async def order_payment_method_handler(message: Message, state: FSMContext) -> None:
-    user_id = message.from_user.id if message.from_user else None
-    selected_payment_method = (message.text or "").strip()
-    data = await state.get_data()
-
-    payment_methods = data.get("available_payment_methods")
-    if not isinstance(payment_methods, list):
-        payment_methods = get_payment_methods()
-        await state.update_data(available_payment_methods=payment_methods)
-
-    if selected_payment_method not in payment_methods:
-        logger.info(
-            "Unknown payment method input: user_id=%s value=%s",
-            user_id,
-            selected_payment_method,
-        )
-        await message.answer(
-            "Оберіть спосіб оплати з кнопок нижче.",
-            reply_markup=build_payment_methods_keyboard(),
-        )
-        return
-
-    await state.set_state(OrderStates.waiting_for_comment)
-    await state.update_data(
-        selected_payment_method=selected_payment_method,
-        comment=None,
-        awaiting_order_confirmation=False,
-        order_submission_in_progress=False,
-    )
-    logger.info("Payment method selected: user_id=%s method=%s", user_id, selected_payment_method)
-    await message.answer(
-        "Введіть коментар до замовлення або натисніть «Без коментаря».",
-        reply_markup=build_skip_comment_keyboard(),
+    await _send_product_menu(
+        message,
+        state,
+        text=(
+            f"{action_text}\n{_format_cart_summary(cart)}\n"
+            f"Оберіть наступний товар, «{SHOW_CART_BUTTON_TEXT}» або «{FINISH_ORDER_BUTTON_TEXT}»."
+        ),
     )
 
 
@@ -970,15 +1116,15 @@ async def order_payment_method_handler(message: Message, state: FSMContext) -> N
 async def order_comment_handler(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id if message.from_user else None
     user_value = (message.text or "").strip()
-    data = await state.get_data()
+    if user_id is None:
+        await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
+        return
 
+    data = await state.get_data()
     awaiting_confirmation = bool(data.get("awaiting_order_confirmation"))
+
     if awaiting_confirmation:
         if user_value == CONFIRM_ORDER_BUTTON_TEXT:
-            if user_id is None:
-                await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
-                return
-
             submit_lock = _get_submit_lock(user_id)
             if submit_lock.locked():
                 await message.answer("Замовлення вже відправляється. Зачекайте, будь ласка.")
@@ -989,7 +1135,6 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
                 if not bool(fresh_data.get("awaiting_order_confirmation")):
                     await message.answer("Замовлення вже оброблено.")
                     return
-
                 if bool(fresh_data.get("order_submission_in_progress")):
                     await message.answer("Замовлення вже відправляється. Зачекайте, будь ласка.")
                     return
@@ -1006,13 +1151,13 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
                 try:
                     result = await one_c_service.create_order(
                         order_payload,
-                        telegram_user_id=int(user_id or 0),
+                        telegram_user_id=user_id,
                     )
-                except OneCServiceError:
+                except OneCServiceError as exc:
                     _last_submit_attempts.pop(user_id, None)
                     await state.update_data(order_submission_in_progress=False)
                     logger.exception("Order submit failed: user_id=%s", user_id)
-                    await message.answer(_service_unavailable_message())
+                    await message.answer(_service_unavailable_message(exc))
                     return
 
                 try:
@@ -1022,7 +1167,6 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
 
                 order_number = str(result.get("order_number", "N/A"))
                 await state.clear()
-                logger.info("Order submitted successfully: user_id=%s order_number=%s", user_id, order_number)
                 await message.answer(
                     f"Замовлення успішно відправлено в 1С.\nНомер замовлення: {order_number}",
                     reply_markup=build_main_keyboard(),
@@ -1030,12 +1174,12 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
                 return
 
         if user_value == CANCEL_ORDER_BUTTON_TEXT:
-            await state.clear()
-            logger.info("Order submission cancelled by user: user_id=%s", user_id)
-            await message.answer(
-                "Замовлення скасовано. Кошик збережено, можете повернутись до нього пізніше.",
-                reply_markup=build_main_keyboard(),
+            await state.set_state(OrderStates.waiting_for_product)
+            await state.update_data(
+                awaiting_order_confirmation=False,
+                order_submission_in_progress=False,
             )
+            await _send_product_menu(message, state, text="Підтвердження скасовано. Продовжуйте роботу з каталогом.")
             return
 
         await message.answer(
@@ -1062,10 +1206,8 @@ async def order_comment_handler(message: Message, state: FSMContext) -> None:
         awaiting_order_confirmation=True,
         order_submission_in_progress=False,
     )
-    updated_data = await state.get_data()
-    summary_text = _build_order_summary(updated_data)
-    logger.info("Comment processed, waiting confirmation: user_id=%s", user_id)
+    summary = _build_order_summary(await state.get_data())
     await message.answer(
-        f"{summary_text}\n\nПідтвердити відправку в 1С?",
+        f"{summary}\n\nПідтвердити відправку в 1С?",
         reply_markup=build_options_keyboard([CONFIRM_ORDER_BUTTON_TEXT, CANCEL_ORDER_BUTTON_TEXT]),
     )
