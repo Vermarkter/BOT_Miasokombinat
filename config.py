@@ -25,7 +25,12 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="ONE_C_X_BOT_TOKEN",
     )
+    mock_mode_on_1c_failure: bool = Field(
+        default=True,
+        validation_alias="MOCK_MODE_ON_1C_FAILURE",
+    )
     admin_ids: str = Field(default="", validation_alias="ADMIN_IDS")
+    support_contact: str = Field(default="+380000000000", validation_alias="SUPPORT_CONTACT")
     database_url: str = Field(
         default="sqlite+aiosqlite:///./data/meat_bot.db",
         validation_alias="DATABASE_URL",

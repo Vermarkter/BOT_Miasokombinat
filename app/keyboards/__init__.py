@@ -6,7 +6,13 @@ from app.keyboards.admin import (
     build_admin_menu_keyboard,
 )
 from app.keyboards.auth import build_request_contact_keyboard
-from app.keyboards.main import NEW_ORDER_BUTTON_TEXT, build_main_keyboard
+from app.keyboards.main import (
+    CREATE_ORDER_BUTTON_TEXT,
+    HISTORY_BUTTON_TEXT,
+    NEW_ORDER_BUTTON_TEXT,
+    SALES_TODAY_BUTTON_TEXT,
+    build_main_keyboard,
+)
 from app.keyboards.order import (
     NO_COMMENT_BUTTON_TEXT,
     SHOW_CART_BUTTON_TEXT,
@@ -23,8 +29,11 @@ __all__ = [
     "ADMIN_BROADCAST_BUTTON_TEXT",
     "ADMIN_CANCEL_BUTTON_TEXT",
     "ADMIN_STATS_BUTTON_TEXT",
+    "CREATE_ORDER_BUTTON_TEXT",
+    "HISTORY_BUTTON_TEXT",
     "NEW_ORDER_BUTTON_TEXT",
     "NO_COMMENT_BUTTON_TEXT",
+    "SALES_TODAY_BUTTON_TEXT",
     "SHOW_CART_BUTTON_TEXT",
     "build_admin_cancel_keyboard",
     "build_admin_menu_keyboard",

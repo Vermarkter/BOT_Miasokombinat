@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from datetime import date
 from typing import Any
 
 from aiogram import F, Router
@@ -10,8 +11,10 @@ from aiogram.types import CallbackQuery, Message
 
 from app.database import CartRepository, UserRepository, auth_storage
 from app.keyboards import (
+    HISTORY_BUTTON_TEXT,
     NEW_ORDER_BUTTON_TEXT,
     NO_COMMENT_BUTTON_TEXT,
+    SALES_TODAY_BUTTON_TEXT,
     SHOW_CART_BUTTON_TEXT,
     build_cart_inline_keyboard,
     build_main_keyboard,
@@ -21,12 +24,14 @@ from app.keyboards import (
 from app.services import OneCService, OneCServiceError
 from app.states import OrderStates
 from app.utils import QuantityValidationError, validate_quantity
+from config import get_settings
 
 router = Router()
 logger = logging.getLogger(__name__)
 one_c_service = OneCService()
 cart_repository = CartRepository()
 user_repository = UserRepository()
+settings = get_settings()
 
 FINISH_ORDER_BUTTON_TEXT = "Оформити замовлення"
 LAST_ORDERS_BUTTON_TEXT = "Останні замовлення"
@@ -205,6 +210,19 @@ def _build_history_message(history_rows: list[dict[str, Any]], client_name: str)
     return "\n".join(lines)
 
 
+def _calc_sales_today(history_rows: list[dict[str, Any]]) -> tuple[int, float]:
+    today_iso = date.today().isoformat()
+    count = 0
+    total = 0.0
+    for row in history_rows:
+        order_date = str(row.get("date", "")).strip()
+        if not order_date.startswith(today_iso):
+            continue
+        count += 1
+        total += _to_float(row.get("total", 0.0), default=0.0)
+    return count, total
+
+
 def _build_labeled_map(
     rows: list[dict[str, Any]],
     *,
@@ -359,6 +377,40 @@ async def _resolve_agent_id(user_id: int, state: FSMContext) -> str | None:
 
     await state.update_data(agent_id=agent_id)
     return agent_id
+
+
+async def _resolve_first_client_for_history(user_id: int, state: FSMContext) -> tuple[str, str] | None:
+    data = await state.get_data()
+    selected_client_id = str(data.get("selected_client_id", "")).strip()
+    selected_client_name = str(data.get("selected_client", "")).strip()
+    if selected_client_id:
+        return selected_client_id, selected_client_name or "Клієнт"
+
+    agent_id = await _resolve_agent_id(user_id, state)
+    if not agent_id:
+        return None
+
+    clients = await _fetch_clients_for_parent(user_id=user_id, agent_id=agent_id, parent_id=None)
+    for row in clients:
+        if not bool(row.get("is_folder")):
+            return str(row.get("id", "")).strip(), str(row.get("name", "Клієнт")).strip() or "Клієнт"
+
+    for row in clients:
+        if not bool(row.get("is_folder")):
+            continue
+        nested = await _fetch_clients_for_parent(
+            user_id=user_id,
+            agent_id=agent_id,
+            parent_id=str(row.get("id", "")).strip() or None,
+        )
+        for nested_row in nested:
+            if not bool(nested_row.get("is_folder")):
+                return (
+                    str(nested_row.get("id", "")).strip(),
+                    str(nested_row.get("name", "Клієнт")).strip() or "Клієнт",
+                )
+
+    return None
 
 
 async def _load_cart_from_db(user_id: int) -> list[dict[str, Any]]:
@@ -625,6 +677,96 @@ async def show_cart_handler(message: Message, state: FSMContext) -> None:
         return
 
     await _send_cart_preview(message, state, user_id)
+
+
+@router.message(Command("history"))
+@router.message(F.text == HISTORY_BUTTON_TEXT)
+async def history_handler(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    logger.info("History requested: user_id=%s", user_id)
+
+    if user_id is None:
+        await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
+        return
+    if not await _is_authorized_user(user_id):
+        await message.answer("Спочатку авторизуйтеся через /start.")
+        return
+
+    try:
+        client_info = await _resolve_first_client_for_history(user_id, state)
+    except OneCServiceError as exc:
+        logger.exception("Failed to resolve client for history: user_id=%s", user_id)
+        await message.answer(_service_unavailable_message(exc))
+        return
+
+    if client_info is None:
+        await message.answer("Не знайдено клієнтів. Почніть з /order.")
+        return
+
+    client_id, client_name = client_info
+    try:
+        history = await one_c_service.get_orders_history(
+            client_id=client_id,
+            telegram_user_id=user_id,
+        )
+    except OneCServiceError as exc:
+        logger.exception("Failed to fetch order history: user_id=%s client_id=%s", user_id, client_id)
+        await message.answer(_service_unavailable_message(exc))
+        return
+
+    history_rows = _serialize_history_rows(history)
+    await message.answer(_build_history_message(history_rows, client_name), reply_markup=build_main_keyboard())
+
+
+@router.message(F.text == SALES_TODAY_BUTTON_TEXT)
+async def sales_today_handler(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    logger.info("Sales today requested: user_id=%s", user_id)
+
+    if user_id is None:
+        await message.answer("Не вдалося визначити користувача. Спробуйте ще раз.")
+        return
+    if not await _is_authorized_user(user_id):
+        await message.answer("Спочатку авторизуйтеся через /start.")
+        return
+
+    try:
+        client_info = await _resolve_first_client_for_history(user_id, state)
+    except OneCServiceError as exc:
+        logger.exception("Failed to resolve client for sales report: user_id=%s", user_id)
+        await message.answer(_service_unavailable_message(exc))
+        return
+
+    if client_info is None:
+        await message.answer("Не знайдено клієнтів для звіту. Почніть з /order.")
+        return
+
+    client_id, client_name = client_info
+    try:
+        history = await one_c_service.get_orders_history(
+            client_id=client_id,
+            telegram_user_id=user_id,
+        )
+    except OneCServiceError as exc:
+        logger.exception("Failed to fetch orders for sales report: user_id=%s client_id=%s", user_id, client_id)
+        await message.answer(_service_unavailable_message(exc))
+        return
+
+    history_rows = _serialize_history_rows(history)
+    count, total = _calc_sales_today(history_rows)
+    await message.answer(
+        f"Продажі за сьогодні:\nКлієнт: {client_name}\nЗамовлень: {count}\nСума: {_format_money(total)} грн",
+        reply_markup=build_main_keyboard(),
+    )
+
+
+@router.message(Command("support"))
+async def support_handler(message: Message) -> None:
+    await message.answer(
+        "Зв'язок з офісом:\n"
+        f"{settings.support_contact}\n"
+        "Якщо не можете оформити заявку, напишіть коротко проблему і номер точки.",
+    )
 
 
 @router.callback_query(F.data.startswith(CART_DELETE_CALLBACK_PREFIX))

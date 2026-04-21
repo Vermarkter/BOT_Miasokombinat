@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 import aiohttp
@@ -53,6 +54,8 @@ class OrderHistoryItem:
 
 
 class OneCService:
+    NOT_FOUND_MESSAGE = "Агента не знайдено в базі 1С"
+
     def __init__(self, timeout_sec: int = 10) -> None:
         settings = get_settings()
         self.base_url = str(settings.one_c_base_url).rstrip("/") if settings.one_c_base_url else None
@@ -63,6 +66,7 @@ class OneCService:
             if settings.one_c_x_bot_token is not None
             else None
         )
+        self.mock_mode_on_1c_failure = settings.mock_mode_on_1c_failure
         self.timeout_sec = timeout_sec
 
     def _build_auth(self) -> aiohttp.BasicAuth:
@@ -94,8 +98,8 @@ class OneCService:
             "Accept": "application/json",
             "Authorization": auth.encode(),
             "X-Bot-Token": self.x_bot_token,
+            "X-Telegram-User-ID": str(user_id),
         }
-        headers["X-Telegram-User-ID"] = str(user_id)
         if has_body:
             headers["Content-Type"] = "application/json"
 
@@ -299,6 +303,11 @@ class OneCService:
             return "шт"
         return value.strip() or "шт"
 
+    def _can_use_mock(self, error: OneCServiceError) -> bool:
+        if not self.mock_mode_on_1c_failure:
+            return False
+        return str(error).strip() != self.NOT_FOUND_MESSAGE
+
     async def _request_json(
         self,
         method: str,
@@ -354,7 +363,7 @@ class OneCService:
                             parsed_body = {"raw_response": raw_body}
 
                     if self._contains_not_found_status(parsed_body):
-                        raise OneCServiceError("Агента не знайдено в базі 1С")
+                        raise OneCServiceError(self.NOT_FOUND_MESSAGE)
 
                     if response.status == 200:
                         return parsed_body
@@ -375,6 +384,78 @@ class OneCService:
             )
             raise OneCServiceError("Не вдалося з'єднатися із сервісом 1С.") from exc
 
+    @staticmethod
+    def _mock_agent(telegram_user_id: int) -> AuthAgent:
+        return AuthAgent(agent_id=f"demo-agent-{telegram_user_id}", name="Демо Агент")
+
+    @staticmethod
+    def _mock_clients(parent_id: str | None) -> list[Client]:
+        mapping: dict[str | None, list[Client]] = {
+            None: [
+                Client(id="demo-folder-stores", name="Тестові магазини", is_folder=True),
+                Client(id="demo-client-1", name="Тестовий Магазин №1", is_folder=False),
+                Client(id="demo-client-2", name="Тестовий Магазин №2", is_folder=False),
+            ],
+            "demo-folder-stores": [
+                Client(id="demo-client-3", name="Тестовий Магазин №3", is_folder=False),
+            ],
+        }
+        return mapping.get(parent_id, [])
+
+    @staticmethod
+    def _mock_contracts(client_id: str) -> list[Contract]:
+        _ = client_id
+        return [
+            Contract(id="demo-contract-main", name="Тестовий договір (Основний)", price_type_id="demo-price-main"),
+            Contract(id="demo-contract-promo", name="Тестовий договір (Акційний)", price_type_id="demo-price-promo"),
+        ]
+
+    @staticmethod
+    def _mock_products(price_type_id: str, parent_id: str | None) -> list[Product]:
+        key = (price_type_id, parent_id)
+        mapping: dict[tuple[str, str | None], list[Product]] = {
+            ("demo-price-main", None): [
+                Product(id="demo-folder-sausage", name="Ковбаси", is_folder=True, unit="шт", price=0.0),
+                Product(id="demo-folder-pate", name="Паштети", is_folder=True, unit="шт", price=0.0),
+                Product(id="demo-product-jerky", name="Джерки Тест (шт)", is_folder=False, unit="шт", price=75.0),
+            ],
+            ("demo-price-main", "demo-folder-sausage"): [
+                Product(id="demo-product-doc", name="Ковбаса Докторська", is_folder=False, unit="кг", price=238.5),
+                Product(id="demo-product-salami", name="Салямі Фірмова", is_folder=False, unit="кг", price=320.0),
+            ],
+            ("demo-price-main", "demo-folder-pate"): [
+                Product(id="demo-product-pate-1", name="Паштет Класичний", is_folder=False, unit="шт", price=42.0),
+                Product(id="demo-product-pate-2", name="Паштет Домашній", is_folder=False, unit="шт", price=48.0),
+            ],
+            ("demo-price-promo", None): [
+                Product(id="demo-product-doc-promo", name="Ковбаса Докторська (акція)", is_folder=False, unit="кг", price=210.0),
+                Product(id="demo-product-pate-promo", name="Паштет Акційний", is_folder=False, unit="шт", price=35.0),
+            ],
+        }
+        return mapping.get(key, mapping.get((price_type_id, None), []))
+
+    @staticmethod
+    def _mock_history(client_id: str) -> list[OrderHistoryItem]:
+        client_suffix = client_id[-3:] if len(client_id) >= 3 else client_id
+        today = datetime.now().date()
+        return [
+            OrderHistoryItem(
+                order_number=f"DEMO-{client_suffix}-001",
+                date=f"{today.isoformat()} 10:15",
+                total=1250.0,
+            ),
+            OrderHistoryItem(
+                order_number=f"DEMO-{client_suffix}-002",
+                date=f"{today.isoformat()} 14:40",
+                total=930.5,
+            ),
+            OrderHistoryItem(
+                order_number=f"DEMO-{client_suffix}-003",
+                date=f"{(today - timedelta(days=1)).isoformat()} 16:20",
+                total=780.0,
+            ),
+        ]
+
     async def authorize_agent(self, phone: str, telegram_user_id: int) -> AuthAgent | None:
         phone_digits = self._normalize_phone_digits(phone)
         masked_phone = f"***{phone_digits[-4:]}" if len(phone_digits) >= 4 else "***"
@@ -383,12 +464,18 @@ class OneCService:
         if len(phone_digits) < 10:
             raise OneCServiceError("Некоректний номер телефону для авторизації.")
 
-        response = await self._request_json(
-            "GET",
-            "auth",
-            telegram_user_id=telegram_user_id,
-            params={"phone": phone_digits},
-        )
+        try:
+            response = await self._request_json(
+                "GET",
+                "auth",
+                telegram_user_id=telegram_user_id,
+                params={"phone": phone_digits},
+            )
+        except OneCServiceError as exc:
+            if self._can_use_mock(exc):
+                logger.warning("1C unavailable during auth, switching to mock mode: reason=%s", str(exc))
+                return self._mock_agent(telegram_user_id)
+            raise
 
         is_success = self._parse_success_response(response)
         agent_id, agent_name = self._extract_agent_info(response)
@@ -419,12 +506,19 @@ class OneCService:
         if parent_id:
             params["parent_id"] = parent_id
 
-        response = await self._request_json(
-            "GET",
-            "clients",
-            telegram_user_id=telegram_user_id,
-            params=params,
-        )
+        try:
+            response = await self._request_json(
+                "GET",
+                "clients",
+                telegram_user_id=telegram_user_id,
+                params=params,
+            )
+        except OneCServiceError as exc:
+            if self._can_use_mock(exc):
+                logger.warning("1C unavailable in get_clients, using mock mode: reason=%s", str(exc))
+                return self._mock_clients(parent_id)
+            raise
+
         rows = self._extract_collection(response, ("clients", "items", "data", "result", "rows", "list"))
         if not rows and isinstance(response, dict):
             rows = [response]
@@ -453,12 +547,19 @@ class OneCService:
         return clients
 
     async def get_contracts(self, *, client_id: str, telegram_user_id: int) -> list[Contract]:
-        response = await self._request_json(
-            "GET",
-            "contracts",
-            telegram_user_id=telegram_user_id,
-            params={"client_id": client_id},
-        )
+        try:
+            response = await self._request_json(
+                "GET",
+                "contracts",
+                telegram_user_id=telegram_user_id,
+                params={"client_id": client_id},
+            )
+        except OneCServiceError as exc:
+            if self._can_use_mock(exc):
+                logger.warning("1C unavailable in get_contracts, using mock mode: reason=%s", str(exc))
+                return self._mock_contracts(client_id)
+            raise
+
         rows = self._extract_collection(response, ("contracts", "items", "data", "result", "rows", "list"))
         if not rows and isinstance(response, dict):
             rows = [response]
@@ -510,12 +611,19 @@ class OneCService:
         if parent_id:
             params["parent_id"] = parent_id
 
-        response = await self._request_json(
-            "GET",
-            "products",
-            telegram_user_id=telegram_user_id,
-            params=params,
-        )
+        try:
+            response = await self._request_json(
+                "GET",
+                "products",
+                telegram_user_id=telegram_user_id,
+                params=params,
+            )
+        except OneCServiceError as exc:
+            if self._can_use_mock(exc):
+                logger.warning("1C unavailable in get_products, using mock mode: reason=%s", str(exc))
+                return self._mock_products(price_type_id, parent_id)
+            raise
+
         rows = self._extract_collection(
             response,
             ("products", "items", "data", "result", "rows", "list", "goods", "nomenclature"),
@@ -609,12 +717,19 @@ class OneCService:
             "products": products_payload,
         }
 
-        response = await self._request_json(
-            "POST",
-            "orders",
-            telegram_user_id=telegram_user_id,
-            payload=payload,
-        )
+        try:
+            response = await self._request_json(
+                "POST",
+                "orders",
+                telegram_user_id=telegram_user_id,
+                payload=payload,
+            )
+        except OneCServiceError as exc:
+            if self._can_use_mock(exc):
+                logger.warning("1C unavailable in create_order, using mock mode: reason=%s", str(exc))
+                return {"status": "success", "order_number": f"DEMO-{datetime.now():%Y%m%d%H%M%S}"}
+            raise
+
         order_number = self._extract_order_number(response)
         is_success = self._parse_success_response(response)
         if not order_number and not is_success:
@@ -622,12 +737,19 @@ class OneCService:
         return {"status": "success", "order_number": order_number or "N/A"}
 
     async def get_orders_history(self, *, client_id: str, telegram_user_id: int) -> list[OrderHistoryItem]:
-        response = await self._request_json(
-            "GET",
-            "orders",
-            telegram_user_id=telegram_user_id,
-            params={"client_id": client_id},
-        )
+        try:
+            response = await self._request_json(
+                "GET",
+                "orders",
+                telegram_user_id=telegram_user_id,
+                params={"client_id": client_id},
+            )
+        except OneCServiceError as exc:
+            if self._can_use_mock(exc):
+                logger.warning("1C unavailable in get_orders_history, using mock mode: reason=%s", str(exc))
+                return self._mock_history(client_id)
+            raise
+
         rows = self._extract_collection(response, ("orders", "items", "data", "result", "rows", "list"))
         if not rows and isinstance(response, dict):
             rows = [response]
@@ -640,14 +762,14 @@ class OneCService:
                 row,
                 ("order_number", "orderNumber", "number", "order_id", "id", "code"),
             )
-            date = self._pick_str(
+            order_date = self._pick_str(
                 row,
                 ("date", "created_at", "createdAt", "datetime", "timestamp"),
             ) or "-"
             total = self._pick_float(row, ("total", "sum", "amount"), default=0.0)
             if not number:
                 continue
-            orders.append(OrderHistoryItem(order_number=number, date=date, total=total))
+            orders.append(OrderHistoryItem(order_number=number, date=order_date, total=total))
         return orders
 
     async def check_base_url_status(self, telegram_user_id: int) -> tuple[bool, str]:
