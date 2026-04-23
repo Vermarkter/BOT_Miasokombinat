@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -357,10 +358,14 @@ class OneCService:
                     if not raw_body.strip():
                         parsed_body = {}
                     else:
+                        raw_text = await response.text()
+                        # Видаляємо невидимий маркер BOM (якщо він є)
+                        clean_text = raw_text.lstrip("\ufeff")
                         try:
-                            parsed_body = await response.json(content_type=None)
-                        except aiohttp.ContentTypeError:
-                            parsed_body = {"raw_response": raw_body}
+                            parsed_body = json.loads(clean_text)
+                        except json.JSONDecodeError as exc:
+                            logging.error(f"Помилка парсингу JSON від 1С: {exc}. Текст: {raw_text[:100]}")
+                            raise OneCServiceError("Некоректна відповідь від сервера 1С") from exc
 
                     if self._contains_not_found_status(parsed_body):
                         raise OneCServiceError(self.NOT_FOUND_MESSAGE)
