@@ -361,6 +361,7 @@ def _build_cart_inline_rows(cart: list[dict[str, Any]]) -> list[dict[str, str]]:
 def _build_contract_prompt(
     client_name: str,
     client_debt: float | None,
+    client_limit: float | None,
     *,
     suffix: str = "Будь ласка, оберіть договір для замовлення:",
 ) -> str:
@@ -369,6 +370,10 @@ def _build_contract_prompt(
         lines.append("💰 Поточний борг: <b>немає даних</b>")
     else:
         lines.append(f"💰 Поточний борг: <b>{_format_debt_money(client_debt)} грн</b>")
+    if client_limit is None:
+        lines.append("🏦 Кредитний ліміт: <b>немає даних</b>")
+    else:
+        lines.append(f"🏦 Кредитний ліміт: <b>{_format_debt_money(client_limit)} грн</b>")
     if suffix.strip():
         lines.append(suffix)
     return "\n".join(lines)
@@ -559,8 +564,10 @@ async def _send_contract_menu(message: Message, state: FSMContext, *, text: str 
         labels = []
     selected_client = str(data.get("selected_client", "-")).strip() or "-"
     client_debt_raw = data.get("selected_client_debt")
+    client_limit_raw = data.get("selected_client_limit")
     client_debt = _to_float(client_debt_raw, default=0.0) if client_debt_raw is not None else None
-    prompt = text or _build_contract_prompt(selected_client, client_debt)
+    client_limit = _to_float(client_limit_raw, default=0.0) if client_limit_raw is not None else None
+    prompt = text or _build_contract_prompt(selected_client, client_debt, client_limit)
     await message.answer(
         prompt,
         reply_markup=build_options_keyboard(labels, _contract_extra_buttons()),
@@ -689,6 +696,7 @@ async def _start_order_flow(message: Message, state: FSMContext, *, user_id: int
         selected_client=None,
         selected_client_id=None,
         selected_client_debt=None,
+        selected_client_limit=None,
         selected_contract=None,
         selected_contract_id=None,
         selected_price_type_id=None,
@@ -1091,15 +1099,18 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
     selected_client_id = str(selected_row.get("id", "")).strip()
     selected_client_name = str(selected_row.get("name", "")).strip() or "Клієнт"
     client_debt: float | None = None
+    client_limit: float | None = None
 
     try:
-        client_debt = await one_c_service.get_debt(
+        client_finance = await one_c_service.get_debt(
             client_id=selected_client_id,
             telegram_user_id=user_id,
         )
+        client_debt = client_finance.debt
+        client_limit = client_finance.limit
     except OneCServiceError as exc:
         logger.warning(
-            "Failed to fetch client debt, debt will be shown as unavailable: user_id=%s client_id=%s error=%s",
+            "Failed to fetch client finance, values will be shown as unavailable: user_id=%s client_id=%s error=%s",
             user_id,
             selected_client_id,
             str(exc),
@@ -1121,6 +1132,7 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
         selected_client=selected_client_name,
         selected_client_id=selected_client_id,
         selected_client_debt=client_debt,
+        selected_client_limit=client_limit,
         selected_contract=None,
         selected_contract_id=None,
         selected_price_type_id=None,
@@ -1140,13 +1152,13 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
             message,
             state,
             text=(
-                f"{_build_contract_prompt(selected_client_name, client_debt, suffix='')}\n"
+                f"{_build_contract_prompt(selected_client_name, client_debt, client_limit, suffix='')}\n"
                 "⚠️ Для цього клієнта не знайдено договорів. Можна переглянути історію або повернутися назад."
             ),
         )
         return
 
-    await _send_contract_menu(message, state, text=_build_contract_prompt(selected_client_name, client_debt))
+    await _send_contract_menu(message, state, text=_build_contract_prompt(selected_client_name, client_debt, client_limit))
 
 
 @router.message(OrderStates.waiting_for_contract)

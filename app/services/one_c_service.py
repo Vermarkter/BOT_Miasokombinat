@@ -61,6 +61,12 @@ class OrderHistoryItem:
     total: float
 
 
+@dataclass(frozen=True, slots=True)
+class ClientFinance:
+    debt: float
+    limit: float | None
+
+
 class OneCService:
     NOT_FOUND_MESSAGE = "Агента не знайдено в базі 1С"
 
@@ -94,19 +100,19 @@ class OneCService:
         self,
         *,
         auth: aiohttp.BasicAuth,
-        user_id: int,
+        telegram_user_id: int,
         has_body: bool,
     ) -> tuple[dict[str, str], dict[str, str]]:
         if not self.x_bot_token:
             raise OneCServiceError("Секретний ключ 1С не налаштований. Зверніться до адміністратора.")
-        if user_id <= 0:
+        if telegram_user_id <= 0:
             raise OneCServiceError("Не вдалося визначити Telegram ID користувача.")
 
         headers: dict[str, str] = {
             "Accept": "application/json",
             "Authorization": auth.encode(),
             "X-Bot-Token": self.x_bot_token,
-            "X-Telegram-User-ID": str(user_id),
+            "X-Telegram-User-ID": str(telegram_user_id),
         }
         if has_body:
             headers["Content-Type"] = "application/json"
@@ -115,7 +121,7 @@ class OneCService:
             "Accept": "application/json",
             "Authorization": "Basic ***",
             "X-Bot-Token": "***",
-            "X-Telegram-User-ID": str(user_id),
+            "X-Telegram-User-ID": str(telegram_user_id),
         }
         if has_body:
             log_headers["Content-Type"] = "application/json"
@@ -366,6 +372,61 @@ class OneCService:
 
         return 0.0
 
+    @staticmethod
+    def _optional_float(value: Any) -> float | None:
+        try:
+            if isinstance(value, str):
+                value = value.replace(",", ".")
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _extract_limit_amount(cls, payload: Any) -> float | None:
+        if isinstance(payload, (int, float)):
+            return float(payload)
+
+        if isinstance(payload, str):
+            return cls._optional_float(payload)
+
+        if isinstance(payload, list):
+            for item in payload:
+                amount = cls._extract_limit_amount(item)
+                if amount is not None:
+                    return amount
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        limit_keys = (
+            "limit",
+            "credit_limit",
+            "creditLimit",
+            "debt_limit",
+            "debtLimit",
+            "allowed_debt",
+            "allowedDebt",
+            "max_debt",
+            "maxDebt",
+        )
+        for key in limit_keys:
+            if key not in payload:
+                continue
+            amount = cls._optional_float(payload.get(key))
+            if amount is not None:
+                return amount
+
+        for key in ("data", "result", "payload", "client", "debt_info", "finance"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            amount = cls._extract_limit_amount(value)
+            if amount is not None:
+                return amount
+
+        return None
+
     def _can_use_mock(self, error: OneCServiceError) -> bool:
         if self.mock_mode:
             return True
@@ -387,7 +448,7 @@ class OneCService:
         timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
         headers, log_headers = self._build_headers(
             auth=auth,
-            user_id=telegram_user_id,
+            telegram_user_id=telegram_user_id,
             has_body=payload is not None,
         )
 
@@ -545,6 +606,15 @@ class OneCService:
             "demo-client-3": 340.5,
         }
         return mapping.get(client_id, 0.0)
+
+    @staticmethod
+    def _mock_limit(client_id: str) -> float | None:
+        mapping = {
+            "demo-client-1": 5000.0,
+            "demo-client-2": 3000.0,
+            "demo-client-3": 1500.0,
+        }
+        return mapping.get(client_id)
 
     async def authorize_agent(self, phone: str, telegram_user_id: int) -> AuthAgent | None:
         phone_digits = self._normalize_phone_digits(phone)
@@ -710,10 +780,13 @@ class OneCService:
         contracts.sort(key=lambda item: item.name.casefold())
         return contracts
 
-    async def get_debt(self, client_id: str, telegram_user_id: int) -> float:
+    async def get_debt(self, client_id: str, telegram_user_id: int) -> ClientFinance:
         if self.mock_mode:
             logger.info("Mock mode enabled: get_debt user_id=%s client_id=%s", telegram_user_id, client_id)
-            return self._mock_debt(client_id)
+            return ClientFinance(
+                debt=self._mock_debt(client_id),
+                limit=self._mock_limit(client_id),
+            )
 
         try:
             response = await self._request_json(
@@ -722,16 +795,23 @@ class OneCService:
                 telegram_user_id=telegram_user_id,
                 params={"client_id": client_id},
             )
-            return self._extract_debt_amount(response)
+            return ClientFinance(
+                debt=self._extract_debt_amount(response),
+                limit=self._extract_limit_amount(response),
+            )
         except OneCServiceError as exc:
             if self._can_use_mock(exc):
                 logger.warning("1C unavailable in get_debt, using mock mode: reason=%s", str(exc))
-                return self._mock_debt(client_id)
+                return ClientFinance(
+                    debt=self._mock_debt(client_id),
+                    limit=self._mock_limit(client_id),
+                )
             raise
 
     async def get_client_debt(self, client_id: str, telegram_user_id: int) -> float:
         # Backward compatibility alias.
-        return await self.get_debt(client_id=client_id, telegram_user_id=telegram_user_id)
+        finance = await self.get_debt(client_id=client_id, telegram_user_id=telegram_user_id)
+        return finance.debt
 
     async def get_products(
         self,
@@ -934,7 +1014,7 @@ class OneCService:
         auth = self._build_auth()
         headers, log_headers = self._build_headers(
             auth=auth,
-            user_id=telegram_user_id,
+            telegram_user_id=telegram_user_id,
             has_body=False,
         )
 
