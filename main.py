@@ -8,36 +8,38 @@ from aiogram.types import BotCommand, BotCommandScopeDefault
 from app.database import init_db
 from app.handlers import get_routers
 from app.utils.logger import setup_logging
-from config import get_settings
+from config import settings as app_settings
 
 
 async def main() -> None:
-    settings = get_settings()
-    setup_logging(settings.log_level)
+    setup_logging(app_settings.log_level)
     await init_db()
 
     bot = Bot(
-        token=settings.bot_token,
+        token=app_settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Головна / Авторизація"),
-            BotCommand(command="order", description="Нова заявка"),
-            BotCommand(command="history", description="Останні замовлення"),
-            BotCommand(command="cart", description="Мій кошик"),
-            BotCommand(command="support", description="Зв'язок з офісом"),
-        ],
-        scope=BotCommandScopeDefault(),
-    )
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Головна / Авторизація"),
+                BotCommand(command="order", description="Нова заявка"),
+                BotCommand(command="history", description="Останні замовлення"),
+                BotCommand(command="cart", description="Мій кошик"),
+                BotCommand(command="support", description="Зв'язок з офісом"),
+            ],
+            scope=BotCommandScopeDefault(),
+        )
 
-    dp = Dispatcher()
+        dp = Dispatcher()
 
-    for router in get_routers():
-        dp.include_router(router)
+        for router in get_routers():
+            dp.include_router(router)
 
-    await dp.start_polling(bot)
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":

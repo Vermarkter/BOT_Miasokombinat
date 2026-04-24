@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -49,12 +50,13 @@ class OneCClient:
                             f"1C returned HTTP {response.status}",
                         )
 
-                    if not body.strip():
+                    clean_body = body.lstrip("\ufeff")
+                    if not clean_body.strip():
                         return {"status": "ok"}
 
                     try:
-                        return await response.json(content_type=None)
-                    except aiohttp.ContentTypeError:
+                        return json.loads(clean_body)
+                    except json.JSONDecodeError:
                         return {"status": "ok", "raw_response": body}
         except asyncio.TimeoutError as exc:
             logger.exception("1C timeout while sending order")

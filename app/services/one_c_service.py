@@ -8,7 +8,7 @@ from typing import Any
 import aiohttp
 
 from app.utils import normalize_phone
-from config import get_settings
+from config import settings as app_settings
 
 logger = logging.getLogger(__name__)
 http_logger = logging.getLogger("one_c_http_requests")
@@ -45,6 +45,13 @@ class Product:
     is_folder: bool
     unit: str
     price: float
+    is_promotional: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class OrderResponse:
+    status: str
+    order_number: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,18 +64,18 @@ class OrderHistoryItem:
 class OneCService:
     NOT_FOUND_MESSAGE = "Агента не знайдено в базі 1С"
 
-    def __init__(self, timeout_sec: int = 10) -> None:
-        settings = get_settings()
-        self.base_url = str(settings.one_c_base_url).rstrip("/") if settings.one_c_base_url else None
-        self.username = settings.one_c_username
-        self.password = settings.one_c_password.get_secret_value() if settings.one_c_password else None
+    def __init__(self, timeout_sec: int | None = None) -> None:
+        self.base_url = str(app_settings.one_c_base_url).rstrip("/") if app_settings.one_c_base_url else None
+        self.username = app_settings.one_c_username
+        self.password = app_settings.one_c_password.get_secret_value() if app_settings.one_c_password else None
         self.x_bot_token = (
-            settings.one_c_x_bot_token.get_secret_value()
-            if settings.one_c_x_bot_token is not None
+            app_settings.one_c_x_bot_token.get_secret_value()
+            if app_settings.one_c_x_bot_token is not None
             else None
         )
-        self.mock_mode_on_1c_failure = settings.mock_mode_on_1c_failure
-        self.timeout_sec = timeout_sec
+        self.mock_mode = app_settings.mock_mode
+        self.mock_mode_on_1c_failure = app_settings.mock_mode_on_1c_failure
+        self.timeout_sec = timeout_sec if timeout_sec is not None else app_settings.one_c_timeout
 
     def _build_auth(self) -> aiohttp.BasicAuth:
         if not self.username or not self.password:
@@ -304,7 +311,64 @@ class OneCService:
             return "шт"
         return value.strip() or "шт"
 
+    @staticmethod
+    def _looks_promotional_price(price: float) -> bool:
+        return price > 0 and round(price % 1, 2) == 0.99
+
+    @classmethod
+    def _is_promotional_product_payload(cls, payload: dict[str, Any], *, price: float, name: str) -> bool:
+        if cls._pick_bool(
+            payload,
+            ("is_promotional", "isPromotional", "promo", "is_promo", "promotion", "is_action"),
+            default=False,
+        ):
+            return True
+
+        normalized_name = name.casefold()
+        if any(token in normalized_name for token in ("акція", "акц", "новинка", "promo", "sale", "new", "🔥")):
+            return True
+
+        return cls._looks_promotional_price(price)
+
+    @classmethod
+    def _extract_debt_amount(cls, payload: Any) -> float:
+        if isinstance(payload, (int, float)):
+            return float(payload)
+
+        if isinstance(payload, str):
+            return cls._pick_float({"value": payload}, ("value",), default=0.0)
+
+        if isinstance(payload, list):
+            for item in payload:
+                amount = cls._extract_debt_amount(item)
+                if amount:
+                    return amount
+            return 0.0
+
+        if not isinstance(payload, dict):
+            return 0.0
+
+        direct_amount = cls._pick_float(
+            payload,
+            ("debt", "client_debt", "current_debt", "balance", "saldo", "amount", "sum", "total"),
+            default=0.0,
+        )
+        if direct_amount:
+            return direct_amount
+
+        for key in ("data", "result", "payload", "client", "debt_info"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            amount = cls._extract_debt_amount(value)
+            if amount:
+                return amount
+
+        return 0.0
+
     def _can_use_mock(self, error: OneCServiceError) -> bool:
+        if self.mock_mode:
+            return True
         if not self.mock_mode_on_1c_failure:
             return False
         return str(error).strip() != self.NOT_FOUND_MESSAGE
@@ -355,16 +419,14 @@ class OneCService:
                     )
 
                     parsed_body: Any
-                    if not raw_body.strip():
+                    clean_text = raw_body.lstrip("\ufeff")
+                    if not clean_text.strip():
                         parsed_body = {}
                     else:
-                        raw_text = await response.text()
-                        # Видаляємо невидимий маркер BOM (якщо він є)
-                        clean_text = raw_text.lstrip("\ufeff")
                         try:
                             parsed_body = json.loads(clean_text)
                         except json.JSONDecodeError as exc:
-                            logging.error(f"Помилка парсингу JSON від 1С: {exc}. Текст: {raw_text[:100]}")
+                            logger.error("Помилка парсингу JSON від 1С: %s. Текст: %s", exc, raw_body[:100])
                             raise OneCServiceError("Некоректна відповідь від сервера 1С") from exc
 
                     if self._contains_not_found_status(parsed_body):
@@ -397,12 +459,12 @@ class OneCService:
     def _mock_clients(parent_id: str | None) -> list[Client]:
         mapping: dict[str | None, list[Client]] = {
             None: [
-                Client(id="demo-folder-stores", name="Тестові магазини", is_folder=True),
-                Client(id="demo-client-1", name="Тестовий Магазин №1", is_folder=False),
+                Client(id="demo-folder-stores", name="Демо магазини", is_folder=True),
+                Client(id="demo-client-1", name='Магазин "Ромашка"', is_folder=False),
                 Client(id="demo-client-2", name="Тестовий Магазин №2", is_folder=False),
             ],
             "demo-folder-stores": [
-                Client(id="demo-client-3", name="Тестовий Магазин №3", is_folder=False),
+                Client(id="demo-client-3", name="Тестовий Магазин №1", is_folder=False),
             ],
         }
         return mapping.get(parent_id, [])
@@ -421,20 +483,34 @@ class OneCService:
         mapping: dict[tuple[str, str | None], list[Product]] = {
             ("demo-price-main", None): [
                 Product(id="demo-folder-sausage", name="Ковбаси", is_folder=True, unit="шт", price=0.0),
-                Product(id="demo-folder-pate", name="Паштети", is_folder=True, unit="шт", price=0.0),
-                Product(id="demo-product-jerky", name="Джерки Тест (шт)", is_folder=False, unit="шт", price=75.0),
+                Product(id="demo-folder-sausage-child", name="Сосиски", is_folder=True, unit="шт", price=0.0),
+                Product(id="demo-product-doc", name='Ковбаса "Докторська"', is_folder=False, unit="кг", price=238.5),
+                Product(id="demo-product-kids", name='Сосиски "Дитячі"', is_folder=False, unit="шт", price=95.0),
             ],
             ("demo-price-main", "demo-folder-sausage"): [
-                Product(id="demo-product-doc", name="Ковбаса Докторська", is_folder=False, unit="кг", price=238.5),
+                Product(id="demo-product-doc", name='Ковбаса "Докторська"', is_folder=False, unit="кг", price=238.5),
                 Product(id="demo-product-salami", name="Салямі Фірмова", is_folder=False, unit="кг", price=320.0),
             ],
-            ("demo-price-main", "demo-folder-pate"): [
-                Product(id="demo-product-pate-1", name="Паштет Класичний", is_folder=False, unit="шт", price=42.0),
-                Product(id="demo-product-pate-2", name="Паштет Домашній", is_folder=False, unit="шт", price=48.0),
+            ("demo-price-main", "demo-folder-sausage-child"): [
+                Product(id="demo-product-kids", name='Сосиски "Дитячі"', is_folder=False, unit="шт", price=95.0),
             ],
             ("demo-price-promo", None): [
-                Product(id="demo-product-doc-promo", name="Ковбаса Докторська (акція)", is_folder=False, unit="кг", price=210.0),
-                Product(id="demo-product-pate-promo", name="Паштет Акційний", is_folder=False, unit="шт", price=35.0),
+                Product(
+                    id="demo-product-doc-promo",
+                    name='Ковбаса "Докторська" (акція)',
+                    is_folder=False,
+                    unit="кг",
+                    price=210.0,
+                    is_promotional=True,
+                ),
+                Product(
+                    id="demo-product-kids-promo",
+                    name='Сосиски "Дитячі" (акція)',
+                    is_folder=False,
+                    unit="шт",
+                    price=79.0,
+                    is_promotional=True,
+                ),
             ],
         }
         return mapping.get(key, mapping.get((price_type_id, None), []))
@@ -461,6 +537,15 @@ class OneCService:
             ),
         ]
 
+    @staticmethod
+    def _mock_debt(client_id: str) -> float:
+        mapping = {
+            "demo-client-1": 1250.0,
+            "demo-client-2": 0.0,
+            "demo-client-3": 340.5,
+        }
+        return mapping.get(client_id, 0.0)
+
     async def authorize_agent(self, phone: str, telegram_user_id: int) -> AuthAgent | None:
         phone_digits = self._normalize_phone_digits(phone)
         masked_phone = f"***{phone_digits[-4:]}" if len(phone_digits) >= 4 else "***"
@@ -468,6 +553,10 @@ class OneCService:
 
         if len(phone_digits) < 10:
             raise OneCServiceError("Некоректний номер телефону для авторизації.")
+
+        if self.mock_mode:
+            logger.info("Mock mode enabled: authorize_agent user_id=%s", telegram_user_id)
+            return self._mock_agent(telegram_user_id)
 
         try:
             response = await self._request_json(
@@ -507,9 +596,21 @@ class OneCService:
         telegram_user_id: int,
         parent_id: str | None = None,
     ) -> list[Client]:
-        params: dict[str, Any] = {"agent_id": agent_id}
-        if parent_id:
-            params["parent_id"] = parent_id
+        if self.mock_mode:
+            logger.info("Mock mode enabled: get_clients user_id=%s parent_id=%s", telegram_user_id, parent_id)
+            return self._mock_clients(parent_id)
+
+        clean_agent_id = agent_id.strip()
+        if not clean_agent_id:
+            raise OneCServiceError("Не вдалося визначити agent_id для запиту клієнтів.")
+
+        clean_parent_id = parent_id.strip() if isinstance(parent_id, str) else None
+        params: dict[str, Any] = {
+            "agent_id": clean_agent_id,
+        }
+        # For the first level, parent_id is omitted as agreed with 1C.
+        if clean_parent_id:
+            params["parent_id"] = clean_parent_id
 
         try:
             response = await self._request_json(
@@ -552,6 +653,10 @@ class OneCService:
         return clients
 
     async def get_contracts(self, *, client_id: str, telegram_user_id: int) -> list[Contract]:
+        if self.mock_mode:
+            logger.info("Mock mode enabled: get_contracts user_id=%s client_id=%s", telegram_user_id, client_id)
+            return self._mock_contracts(client_id)
+
         try:
             response = await self._request_json(
                 "GET",
@@ -605,6 +710,29 @@ class OneCService:
         contracts.sort(key=lambda item: item.name.casefold())
         return contracts
 
+    async def get_debt(self, client_id: str, telegram_user_id: int) -> float:
+        if self.mock_mode:
+            logger.info("Mock mode enabled: get_debt user_id=%s client_id=%s", telegram_user_id, client_id)
+            return self._mock_debt(client_id)
+
+        try:
+            response = await self._request_json(
+                "GET",
+                "debt",
+                telegram_user_id=telegram_user_id,
+                params={"client_id": client_id},
+            )
+            return self._extract_debt_amount(response)
+        except OneCServiceError as exc:
+            if self._can_use_mock(exc):
+                logger.warning("1C unavailable in get_debt, using mock mode: reason=%s", str(exc))
+                return self._mock_debt(client_id)
+            raise
+
+    async def get_client_debt(self, client_id: str, telegram_user_id: int) -> float:
+        # Backward compatibility alias.
+        return await self.get_debt(client_id=client_id, telegram_user_id=telegram_user_id)
+
     async def get_products(
         self,
         *,
@@ -612,6 +740,15 @@ class OneCService:
         telegram_user_id: int,
         parent_id: str | None = None,
     ) -> list[Product]:
+        if self.mock_mode:
+            logger.info(
+                "Mock mode enabled: get_products user_id=%s price_type_id=%s parent_id=%s",
+                telegram_user_id,
+                price_type_id,
+                parent_id,
+            )
+            return self._mock_products(price_type_id, parent_id)
+
         params: dict[str, Any] = {"price_type_id": price_type_id}
         if parent_id:
             params["parent_id"] = parent_id
@@ -660,6 +797,7 @@ class OneCService:
             )
             unit = self._normalize_unit(self._pick_str(row, ("unit", "uom", "measure", "unit_name")) or "шт")
             price = self._pick_float(row, ("price", "price_per_unit", "unit_price", "cost"), default=0.0)
+            is_promotional = self._is_promotional_product_payload(row, price=price, name=name)
 
             seen_ids.add(product_id)
             products.append(
@@ -669,13 +807,14 @@ class OneCService:
                     is_folder=is_folder,
                     unit=unit,
                     price=price,
+                    is_promotional=is_promotional,
                 ),
             )
 
         products.sort(key=lambda item: (not item.is_folder, item.name.casefold()))
         return products
 
-    async def create_order(self, order_data: dict[str, Any], telegram_user_id: int) -> dict[str, Any]:
+    async def create_order(self, order_data: dict[str, Any], telegram_user_id: int) -> OrderResponse:
         client_id = str(order_data.get("client_id", "")).strip()
         contract_id = str(order_data.get("contract_id", "")).strip()
         raw_products = order_data.get("products", order_data.get("items", []))
@@ -722,6 +861,10 @@ class OneCService:
             "products": products_payload,
         }
 
+        if self.mock_mode:
+            logger.info("Mock mode enabled: create_order user_id=%s payload=%s", telegram_user_id, payload)
+            return OrderResponse(status="success", order_number=f"DEMO-{datetime.now():%Y%m%d%H%M%S}")
+
         try:
             response = await self._request_json(
                 "POST",
@@ -732,16 +875,20 @@ class OneCService:
         except OneCServiceError as exc:
             if self._can_use_mock(exc):
                 logger.warning("1C unavailable in create_order, using mock mode: reason=%s", str(exc))
-                return {"status": "success", "order_number": f"DEMO-{datetime.now():%Y%m%d%H%M%S}"}
+                return OrderResponse(status="success", order_number=f"DEMO-{datetime.now():%Y%m%d%H%M%S}")
             raise
 
         order_number = self._extract_order_number(response)
         is_success = self._parse_success_response(response)
         if not order_number and not is_success:
             raise OneCServiceError("Не вдалося отримати підтвердження створення замовлення від 1С.")
-        return {"status": "success", "order_number": order_number or "N/A"}
+        return OrderResponse(status="success", order_number=order_number or "N/A")
 
     async def get_orders_history(self, *, client_id: str, telegram_user_id: int) -> list[OrderHistoryItem]:
+        if self.mock_mode:
+            logger.info("Mock mode enabled: get_orders_history user_id=%s client_id=%s", telegram_user_id, client_id)
+            return self._mock_history(client_id)
+
         try:
             response = await self._request_json(
                 "GET",

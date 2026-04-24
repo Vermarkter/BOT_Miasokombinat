@@ -52,16 +52,23 @@ def build_cart_inline_keyboard(cart_rows: list[dict[str, str]]) -> InlineKeyboar
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{product_name} - {quantity} - {price} - [Видалити]",
-                    callback_data=f"cart:delete:{product_id}",
+                    text=f"🥩 {product_name} • {quantity} • {price}",
+                    callback_data="cart:noop",
                 ),
+            ],
+        )
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(text="➖", callback_data=f"cart:minus:{product_id}"),
+                InlineKeyboardButton(text="➕", callback_data=f"cart:plus:{product_id}"),
+                InlineKeyboardButton(text="❌ Видалити", callback_data=f"cart:delete:{product_id}"),
             ],
         )
 
     if cart_rows:
         keyboard_rows.append(
             [
-                InlineKeyboardButton(text="Очистити весь кошик", callback_data="cart:clear"),
+                InlineKeyboardButton(text="🧹 Очистити весь кошик", callback_data="cart:clear"),
             ],
         )
     return InlineKeyboardMarkup(inline_keyboard=keyboard_rows)

@@ -18,11 +18,10 @@ from app.keyboards import (
     build_main_keyboard,
 )
 from app.states import AdminStates
-from config import get_settings
+from config import settings
 
 router = Router()
 logger = logging.getLogger(__name__)
-settings = get_settings()
 user_repository = UserRepository()
 cart_repository = CartRepository()
 

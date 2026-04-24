@@ -18,6 +18,7 @@ Copy-Item .env.example .env
 - `ONE_C_USERNAME`
 - `ONE_C_PASSWORD`
 - `ONE_C_X_BOT_TOKEN`
+- `ONE_C_TIMEOUT`
 - `ADMIN_IDS`
 
 ## 2) Ручний запуск (перевірка)
@@ -27,26 +28,62 @@ Copy-Item .env.example .env
 python main.py
 ```
 
-## 3) Запуск як Windows Service (NSSM, рекомендовано)
+## 3) Запуск як Windows Service через NSSM
 
-1. Завантажте `nssm.exe` і додайте в `PATH` (або передайте повний шлях).
-2. Відкрийте `PowerShell` **від імені Адміністратора**.
-3. Виконайте:
+Перед установкою сервісу переконайтеся, що:
+- файл `.env` уже створений і заповнений;
+- ручний запуск `python main.py` проходить без помилок;
+- `nssm.exe` доступний або в `PATH`, або за відомим повним шляхом.
+
+Відкрийте `PowerShell` **від імені Адміністратора** і виконайте:
+
+```powershell
+cd C:\path\to\BOT_Miasokombinat
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\deploy\windows\install_meatbot_service.ps1 -ServiceName meatbot -NssmExe "C:\tools\nssm\nssm.exe"
+```
+
+Якщо `nssm.exe` вже є в `PATH`, параметр `-NssmExe` можна не передавати:
 
 ```powershell
 .\deploy\windows\install_meatbot_service.ps1
 ```
 
-Або з явним шляхом до `nssm.exe`:
+Що робить скрипт:
+- знаходить `ProjectRoot`, `python.exe` і `nssm.exe`;
+- перевіряє наявність `main.py`;
+- створює папку `logs`;
+- встановлює або перевстановлює сервіс `meatbot`;
+- запускає сервіс одразу після оновлення конфігурації.
 
-```powershell
-.\deploy\windows\install_meatbot_service.ps1 -NssmExe "C:\tools\nssm\nssm.exe"
-```
-
-Перевірка:
+Корисні команди перевірки:
 
 ```powershell
 Get-Service meatbot
+sc.exe qc meatbot
+Get-Content .\logs\service_stderr.log -Tail 100
+Get-Content .\logs\service_stdout.log -Tail 100
+```
+
+Оновлення після змін у коді:
+
+```powershell
+git pull
+.\deploy\windows\install_meatbot_service.ps1 -ServiceName meatbot -NssmExe "C:\tools\nssm\nssm.exe"
+```
+
+Керування сервісом:
+
+```powershell
+Restart-Service meatbot
+Stop-Service meatbot
+Start-Service meatbot
+```
+
+Видалення сервісу:
+
+```powershell
+nssm remove meatbot confirm
 ```
 
 ## 4) Щоденний backup БД (Task Scheduler)

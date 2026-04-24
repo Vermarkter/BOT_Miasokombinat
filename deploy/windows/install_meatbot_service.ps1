@@ -15,6 +15,16 @@ if (-not (Test-Path $ProjectRoot)) {
     throw "Project root not found: $ProjectRoot"
 }
 
+$mainScript = Join-Path $ProjectRoot "main.py"
+if (-not (Test-Path $mainScript)) {
+    throw "main.py not found: $mainScript"
+}
+
+$envFile = Join-Path $ProjectRoot ".env"
+if (-not (Test-Path $envFile)) {
+    Write-Warning ".env not found in $ProjectRoot. The service will rely on system environment variables."
+}
+
 if (-not $PythonExe) {
     $venvPython = Join-Path $ProjectRoot "venv\Scripts\python.exe"
     if (Test-Path $venvPython) {
@@ -46,6 +56,10 @@ if (-not $nssmPath) {
     throw "NSSM not found. Download it from https://nssm.cc/download or add nssm.exe to PATH."
 }
 
+Write-Host "Project root: $ProjectRoot"
+Write-Host "Python:       $PythonExe"
+Write-Host "NSSM:         $nssmPath"
+
 $logsDir = Join-Path $ProjectRoot "logs"
 New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
 
@@ -57,11 +71,11 @@ if ($existingService) {
     }
 } else {
     Write-Host "Installing service '$ServiceName'..."
-    & $nssmPath install $ServiceName $PythonExe "main.py" | Out-Null
+    & $nssmPath install $ServiceName $PythonExe $mainScript | Out-Null
 }
 
 & $nssmPath set $ServiceName AppDirectory $ProjectRoot | Out-Null
-& $nssmPath set $ServiceName AppParameters "main.py" | Out-Null
+& $nssmPath set $ServiceName AppParameters $mainScript | Out-Null
 & $nssmPath set $ServiceName DisplayName "Meatbot Telegram Service" | Out-Null
 & $nssmPath set $ServiceName Description "Telegram bot for meat plant sales agents" | Out-Null
 & $nssmPath set $ServiceName Start SERVICE_AUTO_START | Out-Null

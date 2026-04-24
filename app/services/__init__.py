@@ -6,6 +6,7 @@ from app.services.one_c_service import (
     OneCService,
     OneCServiceError,
     OrderHistoryItem,
+    OrderResponse,
     Product,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "Product",
     "Client",
     "Contract",
+    "OrderResponse",
     "OrderHistoryItem",
 ]

@@ -5,12 +5,11 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from app.services import OneCService, OneCServiceError
-from config import get_settings
+from config import settings
 
 router = Router()
 logger = logging.getLogger(__name__)
 one_c_service = OneCService()
-settings = get_settings()
 
 
 def _is_admin(message: Message) -> bool:
