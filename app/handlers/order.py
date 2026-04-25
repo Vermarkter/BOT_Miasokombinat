@@ -5,12 +5,18 @@ from datetime import date
 from typing import Any
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from app.database import CartRepository, UserRepository, auth_storage
 from app.keyboards import (
+    CLIENT_CART_CB,
+    CLIENT_PAGE_NEXT_CB,
+    CLIENT_PAGE_PREV_CB,
+    CLIENT_UP_CB,
+    DEFAULT_LIST_PAGE_SIZE,
     HISTORY_BUTTON_TEXT,
     MAIN_MENU_CREATE_ORDER_CB,
     MAIN_MENU_HISTORY_CB,
@@ -18,12 +24,19 @@ from app.keyboards import (
     MAIN_MENU_STATS_CB,
     NEW_ORDER_BUTTON_TEXT,
     NO_COMMENT_BUTTON_TEXT,
+    PRODUCT_CART_CB,
+    PRODUCT_FINISH_CB,
+    PRODUCT_PAGE_NEXT_CB,
+    PRODUCT_PAGE_PREV_CB,
+    PRODUCT_UP_CB,
     PROMO_BUTTON_TEXT,
     SALES_TODAY_BUTTON_TEXT,
     SHOW_CART_BUTTON_TEXT,
     build_cart_inline_keyboard,
+    build_clients_kb,
     build_main_inline_menu,
     build_options_keyboard,
+    build_products_kb,
     build_skip_comment_keyboard,
 )
 from app.services import OneCService, OneCServiceError
@@ -50,6 +63,8 @@ CART_NOOP_CALLBACK = "cart:noop"
 CART_CLEAR_CALLBACK = "cart:clear"
 
 SUBMIT_COOLDOWN_SECONDS = 5.0
+LIST_PAGE_SIZE = DEFAULT_LIST_PAGE_SIZE
+CLIENT_SEARCH_MAX_RESULTS = 120
 _last_submit_attempts: dict[int, float] = {}
 _submit_locks: dict[int, asyncio.Lock] = {}
 
@@ -379,6 +394,82 @@ def _build_contract_prompt(
     return "\n".join(lines)
 
 
+def _normalize_page(total_items: int, page: int, page_size: int = LIST_PAGE_SIZE) -> tuple[int, int]:
+    size = max(1, page_size)
+    total_pages = max(1, (total_items + size - 1) // size) if total_items > 0 else 1
+    safe_page = max(0, min(page, total_pages - 1))
+    return safe_page, total_pages
+
+
+async def _edit_or_send_text(
+    *,
+    message: Message,
+    text: str,
+    reply_markup: Any,
+    edit: bool,
+) -> None:
+    if not edit:
+        await message.answer(text, reply_markup=reply_markup)
+        return
+
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest:
+        await message.answer(text, reply_markup=reply_markup)
+
+
+async def _search_clients_by_name(
+    *,
+    user_id: int,
+    agent_id: str,
+    query: str,
+    max_results: int = CLIENT_SEARCH_MAX_RESULTS,
+) -> list[dict[str, Any]]:
+    normalized = query.casefold().strip()
+    if not normalized:
+        return []
+
+    try:
+        root_rows = await _fetch_clients_for_parent(user_id=user_id, agent_id=agent_id, parent_id=None)
+    except OneCServiceError:
+        raise
+
+    folders_queue: list[str] = []
+    seen_folder_ids: set[str] = set()
+    matches: list[dict[str, Any]] = []
+    seen_client_ids: set[str] = set()
+
+    def process_rows(rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            row_id = str(row.get("id", "")).strip()
+            if not row_id:
+                continue
+            row_name = str(row.get("name", "")).strip()
+            is_folder = bool(row.get("is_folder"))
+
+            if is_folder:
+                if row_id not in seen_folder_ids:
+                    seen_folder_ids.add(row_id)
+                    folders_queue.append(row_id)
+                continue
+
+            if normalized not in row_name.casefold():
+                continue
+            if row_id in seen_client_ids:
+                continue
+            seen_client_ids.add(row_id)
+            matches.append(row)
+
+    process_rows(root_rows)
+
+    while folders_queue and len(matches) < max_results:
+        folder_id = folders_queue.pop(0)
+        rows = await _fetch_clients_for_parent(user_id=user_id, agent_id=agent_id, parent_id=folder_id)
+        process_rows(rows)
+
+    return matches[:max_results]
+
+
 def _is_submit_flood(user_id: int) -> tuple[bool, int]:
     now = time.monotonic()
     last_attempt = _last_submit_attempts.get(user_id)
@@ -545,15 +636,36 @@ def _product_extra_buttons(cart: list[dict[str, Any]]) -> list[str]:
     return buttons
 
 
-async def _send_client_menu(message: Message, state: FSMContext, *, text: str | None = None) -> None:
+async def _send_client_menu(
+    message: Message,
+    state: FSMContext,
+    *,
+    text: str | None = None,
+    edit: bool = False,
+) -> None:
     data = await state.get_data()
-    labels = data.get("client_labels")
-    if not isinstance(labels, list):
-        labels = []
-    prompt = text or "<b>Оберіть клієнта або папку</b>:"
-    await message.answer(
-        prompt,
-        reply_markup=build_options_keyboard(labels, _client_extra_buttons(data)),
+    rows_raw = data.get("current_clients", [])
+    rows = list(rows_raw) if isinstance(rows_raw, list) else []
+    page_raw = data.get("client_page", 0)
+    page = int(page_raw) if isinstance(page_raw, int) else 0
+    safe_page, total_pages = _normalize_page(len(rows), page)
+    await state.update_data(client_page=safe_page)
+
+    prompt = text or "<b>Оберіть клієнта або папку</b>:\nВи також можете надіслати текст для пошуку."
+    prompt = f"{prompt}\nСторінка {safe_page + 1}/{total_pages}"
+    history = data.get("client_parent_history", [])
+    can_go_up = isinstance(history, list) and bool(history)
+    keyboard = build_clients_kb(
+        rows,
+        page=safe_page,
+        page_size=LIST_PAGE_SIZE,
+        can_go_up=can_go_up,
+    )
+    await _edit_or_send_text(
+        message=message,
+        text=prompt,
+        reply_markup=keyboard,
+        edit=edit,
     )
 
 
@@ -574,18 +686,40 @@ async def _send_contract_menu(message: Message, state: FSMContext, *, text: str 
     )
 
 
-async def _send_product_menu(message: Message, state: FSMContext, *, text: str | None = None) -> None:
+async def _send_product_menu(
+    message: Message,
+    state: FSMContext,
+    *,
+    text: str | None = None,
+    edit: bool = False,
+) -> None:
     data = await state.get_data()
-    labels = data.get("product_labels")
-    if not isinstance(labels, list):
-        labels = []
+    rows_raw = data.get("current_products", [])
+    rows = list(rows_raw) if isinstance(rows_raw, list) else []
+    page_raw = data.get("product_page", 0)
+    page = int(page_raw) if isinstance(page_raw, int) else 0
+    safe_page, total_pages = _normalize_page(len(rows), page)
+    await state.update_data(product_page=safe_page)
+
     cart_raw = data.get("cart", [])
     cart = list(cart_raw) if isinstance(cart_raw, list) else []
     promo_only = bool(data.get("promo_only"))
     prompt = text or ("<b>Оберіть папку або акційний товар</b>:" if promo_only else "<b>Оберіть папку або товар</b>:")
-    await message.answer(
-        prompt,
-        reply_markup=build_options_keyboard(labels, _product_extra_buttons(cart)),
+    prompt = f"{prompt}\nСторінка {safe_page + 1}/{total_pages}"
+    history = data.get("product_parent_history", [])
+    can_go_up = isinstance(history, list) and bool(history)
+    keyboard = build_products_kb(
+        rows,
+        page=safe_page,
+        has_cart=bool(cart),
+        page_size=LIST_PAGE_SIZE,
+        can_go_up=can_go_up,
+    )
+    await _edit_or_send_text(
+        message=message,
+        text=prompt,
+        reply_markup=keyboard,
+        edit=edit,
     )
 
 
@@ -615,6 +749,7 @@ async def _set_client_scope(
         client_parent_id=parent_id,
         client_parent_history=parent_history,
         current_clients=rows,
+        client_page=0,
         client_labels=labels,
         client_label_map=label_map,
     )
@@ -651,6 +786,7 @@ async def _fetch_and_set_product_scope(
         product_parent_id=parent_id,
         product_parent_history=parent_history,
         current_products=serialized,
+        product_page=0,
         product_labels=labels,
         product_label_map=label_map,
         promo_only=promo_only,
@@ -710,6 +846,8 @@ async def _start_order_flow(message: Message, state: FSMContext, *, user_id: int
         updating_existing_item=False,
         product_parent_id=None,
         product_parent_history=[],
+        client_page=0,
+        product_page=0,
     )
     await _set_client_scope(
         state,
@@ -1011,6 +1149,370 @@ async def cart_clear_callback_handler(callback: CallbackQuery, state: FSMContext
     await _update_cart_callback_message(callback, cart)
 
 
+@router.callback_query(OrderStates.waiting_for_client)
+async def order_client_callback_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id if callback.from_user else None
+    message = callback.message
+    callback_data = (callback.data or "").strip()
+    if user_id is None or message is None:
+        await callback.answer("⚠️ Не вдалося обробити дію.", show_alert=True)
+        return
+
+    if callback_data.startswith("cart:"):
+        # Let dedicated cart handlers process these callbacks.
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    agent_id = str(data.get("agent_id", "")).strip() or (await _resolve_agent_id(user_id, state) or "")
+    if not agent_id:
+        await callback.answer("⚠️ Потрібна повторна авторизація через /start.", show_alert=True)
+        return
+
+    if callback_data == CLIENT_PAGE_PREV_CB:
+        page = int(data.get("client_page", 0)) if isinstance(data.get("client_page"), int) else 0
+        await state.update_data(client_page=max(0, page - 1))
+        await callback.answer()
+        await _send_client_menu(message, state, edit=True)
+        return
+
+    if callback_data == CLIENT_PAGE_NEXT_CB:
+        rows_raw = data.get("current_clients", [])
+        rows = list(rows_raw) if isinstance(rows_raw, list) else []
+        current_page = int(data.get("client_page", 0)) if isinstance(data.get("client_page"), int) else 0
+        _, total_pages = _normalize_page(len(rows), current_page)
+        await state.update_data(client_page=min(total_pages - 1, current_page + 1))
+        await callback.answer()
+        await _send_client_menu(message, state, edit=True)
+        return
+
+    if callback_data == CLIENT_CART_CB:
+        await callback.answer()
+        await _send_cart_preview(message, state, user_id)
+        return
+
+    if callback_data == CLIENT_UP_CB:
+        history_raw = data.get("client_parent_history", [])
+        history = list(history_raw) if isinstance(history_raw, list) else []
+        if not history:
+            await callback.answer("Ви вже в корені.")
+            await _send_client_menu(message, state, text="Ви вже в кореневій папці клієнтів.", edit=True)
+            return
+
+        previous_parent = history.pop()
+        try:
+            rows = await _fetch_clients_for_parent(
+                user_id=user_id,
+                agent_id=agent_id,
+                parent_id=previous_parent,
+            )
+        except OneCServiceError as exc:
+            logger.exception("Failed to fetch previous clients folder: user_id=%s", user_id)
+            await callback.answer("⚠️ Не вдалося відкрити папку.", show_alert=True)
+            await message.answer(_service_unavailable_message(exc))
+            return
+
+        await _set_client_scope(state, parent_id=previous_parent, parent_history=history, rows=rows)
+        await callback.answer()
+        await _send_client_menu(message, state, edit=True)
+        return
+
+    rows_raw = data.get("current_clients", [])
+    rows = list(rows_raw) if isinstance(rows_raw, list) else []
+    selected_row = next(
+        (row for row in rows if str(row.get("id", "")).strip() == callback_data),
+        None,
+    )
+    if selected_row is None:
+        await callback.answer("⚠️ Застаріла кнопка. Оновіть список.", show_alert=True)
+        await _send_client_menu(message, state, edit=True)
+        return
+
+    if bool(selected_row.get("is_folder")):
+        current_parent = data.get("client_parent_id")
+        history_raw = data.get("client_parent_history", [])
+        history = list(history_raw) if isinstance(history_raw, list) else []
+        history.append(current_parent if isinstance(current_parent, str) else None)
+        new_parent_id = str(selected_row.get("id", "")).strip()
+
+        try:
+            nested_rows = await _fetch_clients_for_parent(
+                user_id=user_id,
+                agent_id=agent_id,
+                parent_id=new_parent_id,
+            )
+        except OneCServiceError as exc:
+            logger.exception("Failed to fetch nested clients folder: user_id=%s", user_id)
+            await callback.answer("⚠️ Не вдалося відкрити папку.", show_alert=True)
+            await message.answer(_service_unavailable_message(exc))
+            return
+
+        if not nested_rows:
+            await callback.answer("Порожня папка")
+            await _send_client_menu(message, state, text="⚠️ У цій папці поки немає клієнтів.", edit=True)
+            return
+
+        await _set_client_scope(state, parent_id=new_parent_id, parent_history=history, rows=nested_rows)
+        await callback.answer()
+        await _send_client_menu(
+            message,
+            state,
+            text=f"📁 Папка: <b>{selected_row.get('name', '-')}</b>\nОберіть далі:",
+            edit=True,
+        )
+        return
+
+    selected_client_id = str(selected_row.get("id", "")).strip()
+    selected_client_name = str(selected_row.get("name", "")).strip() or "Клієнт"
+    client_debt: float | None = None
+    client_limit: float | None = None
+    try:
+        client_finance = await one_c_service.get_debt(
+            client_id=selected_client_id,
+            telegram_user_id=user_id,
+        )
+        client_debt = client_finance.debt
+        client_limit = client_finance.limit
+    except OneCServiceError as exc:
+        logger.warning(
+            "Failed to fetch client finance, values will be shown as unavailable: user_id=%s client_id=%s error=%s",
+            user_id,
+            selected_client_id,
+            str(exc),
+        )
+
+    try:
+        contracts = await one_c_service.get_contracts(
+            client_id=selected_client_id,
+            telegram_user_id=user_id,
+        )
+    except OneCServiceError as exc:
+        logger.exception("Failed to fetch contracts: user_id=%s client_id=%s", user_id, selected_client_id)
+        await callback.answer("⚠️ Не вдалося завантажити договори.", show_alert=True)
+        await message.answer(_service_unavailable_message(exc))
+        return
+
+    serialized_contracts = _serialize_contracts(contracts)
+    await state.set_state(OrderStates.waiting_for_contract)
+    await state.update_data(
+        selected_client=selected_client_name,
+        selected_client_id=selected_client_id,
+        selected_client_debt=client_debt,
+        selected_client_limit=client_limit,
+        selected_contract=None,
+        selected_contract_id=None,
+        selected_price_type_id=None,
+        product_parent_id=None,
+        product_parent_history=[],
+        current_products=[],
+        product_labels=[],
+        product_label_map={},
+        awaiting_order_confirmation=False,
+        order_submission_in_progress=False,
+        comment=None,
+    )
+    await _set_contract_scope(state, serialized_contracts)
+    await callback.answer()
+
+    if not serialized_contracts:
+        await _send_contract_menu(
+            message,
+            state,
+            text=(
+                f"{_build_contract_prompt(selected_client_name, client_debt, client_limit, suffix='')}\n"
+                "⚠️ Для цього клієнта не знайдено договорів. Можна переглянути історію або повернутися назад."
+            ),
+        )
+        return
+
+    await _send_contract_menu(
+        message,
+        state,
+        text=_build_contract_prompt(selected_client_name, client_debt, client_limit),
+    )
+
+
+@router.callback_query(OrderStates.waiting_for_product)
+async def order_product_callback_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id if callback.from_user else None
+    message = callback.message
+    callback_data = (callback.data or "").strip()
+    if user_id is None or message is None:
+        await callback.answer("⚠️ Не вдалося обробити дію.", show_alert=True)
+        return
+
+    if callback_data.startswith("cart:"):
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    selected_price_type_id = str(data.get("selected_price_type_id", "")).strip()
+    promo_only = bool(data.get("promo_only"))
+    if not selected_price_type_id:
+        await callback.answer("⚠️ Спочатку оберіть договір.", show_alert=True)
+        await state.set_state(OrderStates.waiting_for_contract)
+        await _send_contract_menu(message, state)
+        return
+
+    if callback_data == PRODUCT_PAGE_PREV_CB:
+        page = int(data.get("product_page", 0)) if isinstance(data.get("product_page"), int) else 0
+        await state.update_data(product_page=max(0, page - 1))
+        await callback.answer()
+        await _send_product_menu(message, state, edit=True)
+        return
+
+    if callback_data == PRODUCT_PAGE_NEXT_CB:
+        rows_raw = data.get("current_products", [])
+        rows = list(rows_raw) if isinstance(rows_raw, list) else []
+        current_page = int(data.get("product_page", 0)) if isinstance(data.get("product_page"), int) else 0
+        _, total_pages = _normalize_page(len(rows), current_page)
+        await state.update_data(product_page=min(total_pages - 1, current_page + 1))
+        await callback.answer()
+        await _send_product_menu(message, state, edit=True)
+        return
+
+    if callback_data == PRODUCT_CART_CB:
+        await callback.answer()
+        await _send_cart_preview(message, state, user_id)
+        return
+
+    if callback_data == PRODUCT_UP_CB:
+        history_raw = data.get("product_parent_history", [])
+        history = list(history_raw) if isinstance(history_raw, list) else []
+        if history:
+            previous_parent = history.pop()
+            try:
+                await _fetch_and_set_product_scope(
+                    state,
+                    user_id=user_id,
+                    price_type_id=selected_price_type_id,
+                    parent_id=previous_parent if isinstance(previous_parent, str) else None,
+                    parent_history=history,
+                    promo_only=promo_only,
+                )
+            except OneCServiceError as exc:
+                logger.exception("Failed to fetch previous product folder: user_id=%s", user_id)
+                await callback.answer("⚠️ Не вдалося відкрити папку.", show_alert=True)
+                await message.answer(_service_unavailable_message(exc))
+                return
+            await callback.answer()
+            await _send_product_menu(message, state, edit=True)
+            return
+
+        await callback.answer()
+        await state.set_state(OrderStates.waiting_for_contract)
+        await _send_contract_menu(message, state)
+        return
+
+    if callback_data == PRODUCT_FINISH_CB:
+        cart_raw = data.get("cart", [])
+        cart = list(cart_raw) if isinstance(cart_raw, list) else []
+        if not cart:
+            await callback.answer("⚠️ Кошик порожній.", show_alert=True)
+            await _send_product_menu(message, state, text="⚠️ Кошик порожній. Додайте хоча б один товар.", edit=True)
+            return
+
+        await callback.answer()
+        await state.set_state(OrderStates.waiting_for_comment)
+        await state.update_data(
+            awaiting_order_confirmation=False,
+            order_submission_in_progress=False,
+            comment=None,
+        )
+        await message.answer(
+            "🚚 Введіть коментар до замовлення або натисніть «Без коментаря».",
+            reply_markup=build_skip_comment_keyboard(),
+        )
+        return
+
+    rows_raw = data.get("current_products", [])
+    rows = list(rows_raw) if isinstance(rows_raw, list) else []
+    selected_row = next(
+        (row for row in rows if str(row.get("id", "")).strip() == callback_data),
+        None,
+    )
+    if selected_row is None:
+        await callback.answer("⚠️ Застаріла кнопка. Оновіть список.", show_alert=True)
+        await _send_product_menu(message, state, edit=True)
+        return
+
+    if bool(selected_row.get("is_folder")):
+        current_parent = data.get("product_parent_id")
+        history_raw = data.get("product_parent_history", [])
+        history = list(history_raw) if isinstance(history_raw, list) else []
+        history.append(current_parent if isinstance(current_parent, str) else None)
+        new_parent_id = str(selected_row.get("id", "")).strip()
+
+        try:
+            products = await _fetch_and_set_product_scope(
+                state,
+                user_id=user_id,
+                price_type_id=selected_price_type_id,
+                parent_id=new_parent_id,
+                parent_history=history,
+                promo_only=promo_only,
+            )
+        except OneCServiceError as exc:
+            logger.exception("Failed to fetch nested products folder: user_id=%s", user_id)
+            await callback.answer("⚠️ Не вдалося відкрити папку.", show_alert=True)
+            await message.answer(_service_unavailable_message(exc))
+            return
+
+        if not products:
+            await callback.answer("Порожня папка")
+            await _send_product_menu(
+                message,
+                state,
+                text="⚠️ У цій папці поки немає акційних товарів." if promo_only else "⚠️ У цій папці поки немає товарів.",
+                edit=True,
+            )
+            return
+
+        await callback.answer()
+        await _send_product_menu(
+            message,
+            state,
+            text=f"📁 Папка: <b>{selected_row.get('name', '-')}</b>\nОберіть далі:",
+            edit=True,
+        )
+        return
+
+    selected_product_name = str(selected_row.get("name", "")).strip() or "Товар"
+    selected_product_id = str(selected_row.get("id", "")).strip()
+    selected_unit = str(selected_row.get("unit", "")).strip() or "шт"
+    selected_price = _to_float(selected_row.get("price", 0), default=0.0)
+
+    if selected_price <= 0:
+        await callback.answer("⚠️ Ціна не вказана.", show_alert=True)
+        await message.answer("⚠️ Ціна не вказана. Дзвоніть у збут.")
+        await _send_product_menu(message, state, edit=True)
+        return
+
+    cart_raw = data.get("cart", [])
+    cart = list(cart_raw) if isinstance(cart_raw, list) else []
+    existing_item = _find_cart_item(cart, selected_product_id)
+
+    await callback.answer()
+    await state.set_state(OrderStates.waiting_for_quantity)
+    await state.update_data(
+        selected_product=selected_product_name,
+        selected_product_id=selected_product_id,
+        selected_unit=selected_unit,
+        selected_price_per_unit=selected_price,
+        updating_existing_item=existing_item is not None,
+    )
+
+    if existing_item is not None:
+        await message.answer(
+            f"ℹ️ Товар <b>{selected_product_name}</b> вже у кошику: "
+            f"{_format_quantity(existing_item.get('quantity', 0))} {selected_unit}.\n"
+            "Введіть нову кількість, щоб оновити позицію.",
+        )
+        return
+
+    await message.answer(f"Введіть кількість для <b>{selected_product_name}</b> ({selected_unit}).")
+
+
 @router.message(OrderStates.waiting_for_client)
 async def order_client_handler(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id if message.from_user else None
@@ -1059,12 +1561,49 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
         return
 
     client_label_map = data.get("client_label_map")
-    if not isinstance(client_label_map, dict) or user_value not in client_label_map:
-        await message.answer("⚠️ Оберіть клієнта або папку з кнопок нижче.")
-        await _send_client_menu(message, state)
+    selected_row: dict[str, Any] | None = None
+    if isinstance(client_label_map, dict):
+        selected_row = client_label_map.get(user_value)
+
+    if selected_row is None:
+        search_query = user_value.strip()
+        if len(search_query) < 2:
+            await message.answer("⚠️ Введіть щонайменше 2 символи для пошуку клієнта.")
+            await _send_client_menu(message, state)
+            return
+
+        try:
+            matched_clients = await _search_clients_by_name(
+                user_id=user_id,
+                agent_id=agent_id,
+                query=search_query,
+            )
+        except OneCServiceError as exc:
+            logger.exception("Failed to search clients: user_id=%s query=%s", user_id, search_query)
+            await message.answer(_service_unavailable_message(exc))
+            return
+
+        if not matched_clients:
+            await _send_client_menu(
+                message,
+                state,
+                text=f"⚠️ За запитом <b>{search_query}</b> клієнтів не знайдено.",
+            )
+            return
+
+        await _set_client_scope(
+            state,
+            parent_id=None,
+            parent_history=[],
+            rows=matched_clients,
+        )
+        await _send_client_menu(
+            message,
+            state,
+            text=f"🔎 Знайдено {len(matched_clients)} клієнтів за запитом <b>{search_query}</b>.",
+        )
         return
 
-    selected_row = client_label_map[user_value]
     if bool(selected_row.get("is_folder")):
         current_parent = data.get("client_parent_id")
         history_raw = data.get("client_parent_history", [])
