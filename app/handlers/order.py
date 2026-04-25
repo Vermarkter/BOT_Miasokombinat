@@ -173,7 +173,6 @@ def _build_order_summary(order_data: dict[str, Any]) -> str:
     lines = [
         "🚚 <b>Підтвердження замовлення</b>:",
         f"Клієнт: <b>{order_data.get('selected_client', '-')}</b>",
-        f"Договір: <b>{order_data.get('selected_contract', '-')}</b>",
         f"Коментар: {order_data.get('comment', 'Без коментаря')}",
         "",
         "Позиції:",
@@ -225,7 +224,6 @@ def _build_create_order_payload(order_data: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "client_id": str(order_data.get("selected_client_id", "")).strip(),
-        "contract_id": str(order_data.get("selected_contract_id", "")).strip(),
         "products": products,
     }
 
@@ -768,13 +766,13 @@ async def _fetch_and_set_product_scope(
     state: FSMContext,
     *,
     user_id: int,
-    price_type_id: str,
+    client_id: str,
     parent_id: str | None,
     parent_history: list[str | None],
     promo_only: bool,
 ) -> list[dict[str, Any]]:
     products = await one_c_service.get_products(
-        price_type_id=price_type_id,
+        client_id=client_id,
         parent_id=parent_id,
         telegram_user_id=user_id,
     )
@@ -792,6 +790,68 @@ async def _fetch_and_set_product_scope(
         promo_only=promo_only,
     )
     return serialized
+
+
+async def _open_products_for_selected_client(
+    *,
+    message: Message,
+    state: FSMContext,
+    user_id: int,
+    selected_client_id: str,
+    selected_client_name: str,
+    client_debt: float | None,
+    client_limit: float | None,
+    promo_only: bool,
+    edit: bool = False,
+) -> None:
+    try:
+        products = await _fetch_and_set_product_scope(
+            state,
+            user_id=user_id,
+            client_id=selected_client_id,
+            parent_id=None,
+            parent_history=[],
+            promo_only=promo_only,
+        )
+    except OneCServiceError as exc:
+        logger.exception("Failed to fetch root products: user_id=%s client_id=%s", user_id, selected_client_id)
+        await message.answer(_service_unavailable_message(exc))
+        return
+
+    await state.set_state(OrderStates.waiting_for_product)
+    await state.update_data(
+        selected_client=selected_client_name,
+        selected_client_id=selected_client_id,
+        selected_client_debt=client_debt,
+        selected_client_limit=client_limit,
+        selected_product=None,
+        selected_product_id=None,
+        selected_unit=None,
+        selected_price_per_unit=None,
+        updating_existing_item=False,
+        awaiting_order_confirmation=False,
+        order_submission_in_progress=False,
+        comment=None,
+    )
+
+    if not products:
+        await _send_product_menu(
+            message,
+            state,
+            text="⚠️ Каталог товарів порожній для цього клієнта.",
+            edit=edit,
+        )
+        return
+
+    debt_text = "немає даних" if client_debt is None else f"{_format_debt_money(client_debt)} грн"
+    limit_text = "немає даних" if client_limit is None else f"{_format_debt_money(client_limit)} грн"
+    intro = (
+        f"Клієнт: <b>{selected_client_name}</b>\n"
+        f"💰 Поточний борг: <b>{debt_text}</b>\n"
+        f"🏦 Кредитний ліміт: <b>{limit_text}</b>\n"
+        + ("Оберіть папку або акційний товар:" if promo_only else "Оберіть папку або товар:")
+    )
+    await _send_product_menu(message, state, text=intro, edit=edit)
 
 
 async def _start_order_flow(message: Message, state: FSMContext, *, user_id: int, promo_only: bool = False) -> None:
@@ -833,9 +893,6 @@ async def _start_order_flow(message: Message, state: FSMContext, *, user_id: int
         selected_client_id=None,
         selected_client_debt=None,
         selected_client_limit=None,
-        selected_contract=None,
-        selected_contract_id=None,
-        selected_price_type_id=None,
         selected_product=None,
         selected_product_id=None,
         selected_unit=None,
@@ -1281,54 +1338,17 @@ async def order_client_callback_handler(callback: CallbackQuery, state: FSMConte
             str(exc),
         )
 
-    try:
-        contracts = await one_c_service.get_contracts(
-            client_id=selected_client_id,
-            telegram_user_id=user_id,
-        )
-    except OneCServiceError as exc:
-        logger.exception("Failed to fetch contracts: user_id=%s client_id=%s", user_id, selected_client_id)
-        await callback.answer("⚠️ Не вдалося завантажити договори.", show_alert=True)
-        await message.answer(_service_unavailable_message(exc))
-        return
-
-    serialized_contracts = _serialize_contracts(contracts)
-    await state.set_state(OrderStates.waiting_for_contract)
-    await state.update_data(
-        selected_client=selected_client_name,
-        selected_client_id=selected_client_id,
-        selected_client_debt=client_debt,
-        selected_client_limit=client_limit,
-        selected_contract=None,
-        selected_contract_id=None,
-        selected_price_type_id=None,
-        product_parent_id=None,
-        product_parent_history=[],
-        current_products=[],
-        product_labels=[],
-        product_label_map={},
-        awaiting_order_confirmation=False,
-        order_submission_in_progress=False,
-        comment=None,
-    )
-    await _set_contract_scope(state, serialized_contracts)
     await callback.answer()
-
-    if not serialized_contracts:
-        await _send_contract_menu(
-            message,
-            state,
-            text=(
-                f"{_build_contract_prompt(selected_client_name, client_debt, client_limit, suffix='')}\n"
-                "⚠️ Для цього клієнта не знайдено договорів. Можна переглянути історію або повернутися назад."
-            ),
-        )
-        return
-
-    await _send_contract_menu(
-        message,
-        state,
-        text=_build_contract_prompt(selected_client_name, client_debt, client_limit),
+    await _open_products_for_selected_client(
+        message=message,
+        state=state,
+        user_id=user_id,
+        selected_client_id=selected_client_id,
+        selected_client_name=selected_client_name,
+        client_debt=client_debt,
+        client_limit=client_limit,
+        promo_only=bool(data.get("promo_only")),
+        edit=True,
     )
 
 
@@ -1346,12 +1366,12 @@ async def order_product_callback_handler(callback: CallbackQuery, state: FSMCont
         return
 
     data = await state.get_data()
-    selected_price_type_id = str(data.get("selected_price_type_id", "")).strip()
+    selected_client_id = str(data.get("selected_client_id", "")).strip()
     promo_only = bool(data.get("promo_only"))
-    if not selected_price_type_id:
-        await callback.answer("⚠️ Спочатку оберіть договір.", show_alert=True)
-        await state.set_state(OrderStates.waiting_for_contract)
-        await _send_contract_menu(message, state)
+    if not selected_client_id:
+        await callback.answer("⚠️ Спочатку оберіть клієнта.", show_alert=True)
+        await state.set_state(OrderStates.waiting_for_client)
+        await _send_client_menu(message, state)
         return
 
     if callback_data == PRODUCT_PAGE_PREV_CB:
@@ -1385,7 +1405,7 @@ async def order_product_callback_handler(callback: CallbackQuery, state: FSMCont
                 await _fetch_and_set_product_scope(
                     state,
                     user_id=user_id,
-                    price_type_id=selected_price_type_id,
+                    client_id=selected_client_id,
                     parent_id=previous_parent if isinstance(previous_parent, str) else None,
                     parent_history=history,
                     promo_only=promo_only,
@@ -1400,8 +1420,8 @@ async def order_product_callback_handler(callback: CallbackQuery, state: FSMCont
             return
 
         await callback.answer()
-        await state.set_state(OrderStates.waiting_for_contract)
-        await _send_contract_menu(message, state)
+        await state.set_state(OrderStates.waiting_for_client)
+        await _send_client_menu(message, state)
         return
 
     if callback_data == PRODUCT_FINISH_CB:
@@ -1447,7 +1467,7 @@ async def order_product_callback_handler(callback: CallbackQuery, state: FSMCont
             products = await _fetch_and_set_product_scope(
                 state,
                 user_id=user_id,
-                price_type_id=selected_price_type_id,
+                client_id=selected_client_id,
                 parent_id=new_parent_id,
                 parent_history=history,
                 promo_only=promo_only,
@@ -1655,154 +1675,15 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
             str(exc),
         )
 
-    try:
-        contracts = await one_c_service.get_contracts(
-            client_id=selected_client_id,
-            telegram_user_id=user_id,
-        )
-    except OneCServiceError as exc:
-        logger.exception("Failed to fetch contracts: user_id=%s client_id=%s", user_id, selected_client_id)
-        await message.answer(_service_unavailable_message(exc))
-        return
-
-    serialized_contracts = _serialize_contracts(contracts)
-    await state.set_state(OrderStates.waiting_for_contract)
-    await state.update_data(
-        selected_client=selected_client_name,
+    await _open_products_for_selected_client(
+        message=message,
+        state=state,
+        user_id=user_id,
         selected_client_id=selected_client_id,
-        selected_client_debt=client_debt,
-        selected_client_limit=client_limit,
-        selected_contract=None,
-        selected_contract_id=None,
-        selected_price_type_id=None,
-        product_parent_id=None,
-        product_parent_history=[],
-        current_products=[],
-        product_labels=[],
-        product_label_map={},
-        awaiting_order_confirmation=False,
-        order_submission_in_progress=False,
-        comment=None,
-    )
-    await _set_contract_scope(state, serialized_contracts)
-
-    if not serialized_contracts:
-        await _send_contract_menu(
-            message,
-            state,
-            text=(
-                f"{_build_contract_prompt(selected_client_name, client_debt, client_limit, suffix='')}\n"
-                "⚠️ Для цього клієнта не знайдено договорів. Можна переглянути історію або повернутися назад."
-            ),
-        )
-        return
-
-    await _send_contract_menu(message, state, text=_build_contract_prompt(selected_client_name, client_debt, client_limit))
-
-
-@router.message(OrderStates.waiting_for_contract)
-async def order_contract_handler(message: Message, state: FSMContext) -> None:
-    user_id = message.from_user.id if message.from_user else None
-    user_value = (message.text or "").strip()
-    if user_id is None:
-        await message.answer("⚠️ Не вдалося визначити користувача. Спробуйте ще раз.")
-        return
-
-    data = await state.get_data()
-    selected_client_id = str(data.get("selected_client_id", "")).strip()
-    selected_client_name = str(data.get("selected_client", "Клієнт")).strip() or "Клієнт"
-    promo_only = bool(data.get("promo_only"))
-
-    if user_value == SHOW_CART_BUTTON_TEXT:
-        await _send_cart_preview(message, state, user_id)
-        await _send_contract_menu(message, state)
-        return
-
-    if user_value == BACK_BUTTON_TEXT:
-        await state.set_state(OrderStates.waiting_for_client)
-        await _send_client_menu(
-            message,
-            state,
-            text="🔥 Оберіть клієнта або папку для акційного замовлення:" if promo_only else "Оберіть клієнта або папку:",
-        )
-        return
-
-    if user_value == LAST_ORDERS_BUTTON_TEXT:
-        if not selected_client_id:
-            await message.answer("⚠️ Спочатку оберіть клієнта.")
-            return
-        try:
-            history = await one_c_service.get_orders_history(
-                client_id=selected_client_id,
-                telegram_user_id=user_id,
-            )
-        except OneCServiceError as exc:
-            logger.exception("Failed to fetch order history: user_id=%s client_id=%s", user_id, selected_client_id)
-            await message.answer(_service_unavailable_message(exc))
-            return
-
-        history_rows = _serialize_history_rows(history)
-        await message.answer(_build_history_message(history_rows, selected_client_name))
-        await _send_contract_menu(message, state)
-        return
-
-    contract_label_map = data.get("contract_label_map")
-    if not isinstance(contract_label_map, dict) or user_value not in contract_label_map:
-        await message.answer("⚠️ Оберіть договір з кнопок нижче.")
-        await _send_contract_menu(message, state)
-        return
-
-    selected_contract_row = contract_label_map[user_value]
-    selected_contract_id = str(selected_contract_row.get("id", "")).strip()
-    selected_contract_name = str(selected_contract_row.get("name", "")).strip() or "Договір"
-    selected_price_type_id = str(selected_contract_row.get("price_type_id", "")).strip()
-
-    if not selected_contract_id or not selected_price_type_id:
-        await message.answer("⚠️ Не вдалося прочитати дані договору. Оберіть інший договір.")
-        await _send_contract_menu(message, state)
-        return
-
-    try:
-        products = await _fetch_and_set_product_scope(
-            state,
-            user_id=user_id,
-            price_type_id=selected_price_type_id,
-            parent_id=None,
-            parent_history=[],
-            promo_only=promo_only,
-        )
-    except OneCServiceError as exc:
-        logger.exception("Failed to fetch root products: user_id=%s", user_id)
-        await message.answer(_service_unavailable_message(exc))
-        return
-
-    await state.set_state(OrderStates.waiting_for_product)
-    await state.update_data(
-        selected_contract=selected_contract_name,
-        selected_contract_id=selected_contract_id,
-        selected_price_type_id=selected_price_type_id,
-        selected_product=None,
-        selected_product_id=None,
-        selected_unit=None,
-        selected_price_per_unit=None,
-        updating_existing_item=False,
-    )
-
-    if not products:
-        await _send_product_menu(
-            message,
-            state,
-            text="⚠️ Для цього договору не знайдено акційних товарів." if promo_only else "⚠️ Каталог товарів порожній для цього договору.",
-        )
-        return
-
-    await _send_product_menu(
-        message,
-        state,
-        text=(
-            f"Договір: <b>{selected_contract_name}</b>\n"
-            + ("Оберіть папку або акційний товар:" if promo_only else "Оберіть папку або товар:")
-        ),
+        selected_client_name=selected_client_name,
+        client_debt=client_debt,
+        client_limit=client_limit,
+        promo_only=bool(data.get("promo_only")),
     )
 
 
@@ -1815,14 +1696,14 @@ async def order_product_handler(message: Message, state: FSMContext) -> None:
         return
 
     data = await state.get_data()
-    selected_price_type_id = str(data.get("selected_price_type_id", "")).strip()
+    selected_client_id = str(data.get("selected_client_id", "")).strip()
     promo_only = bool(data.get("promo_only"))
-    if not selected_price_type_id:
-        await state.set_state(OrderStates.waiting_for_contract)
-        await _send_contract_menu(
+    if not selected_client_id:
+        await state.set_state(OrderStates.waiting_for_client)
+        await _send_client_menu(
             message,
             state,
-            text="⚠️ Ціна не вказана. Дзвоніть у збут.\nОберіть договір для роботи з каталогом.",
+            text="⚠️ Спочатку оберіть клієнта для роботи з каталогом.",
         )
         return
 
@@ -1840,7 +1721,7 @@ async def order_product_handler(message: Message, state: FSMContext) -> None:
                 await _fetch_and_set_product_scope(
                     state,
                     user_id=user_id,
-                    price_type_id=selected_price_type_id,
+                    client_id=selected_client_id,
                     parent_id=previous_parent if isinstance(previous_parent, str) else None,
                     parent_history=history,
                     promo_only=promo_only,
@@ -1852,8 +1733,8 @@ async def order_product_handler(message: Message, state: FSMContext) -> None:
             await _send_product_menu(message, state)
             return
 
-        await state.set_state(OrderStates.waiting_for_contract)
-        await _send_contract_menu(message, state)
+        await state.set_state(OrderStates.waiting_for_client)
+        await _send_client_menu(message, state)
         return
 
     if user_value == FINISH_ORDER_BUTTON_TEXT:
@@ -1893,7 +1774,7 @@ async def order_product_handler(message: Message, state: FSMContext) -> None:
             products = await _fetch_and_set_product_scope(
                 state,
                 user_id=user_id,
-                price_type_id=selected_price_type_id,
+                client_id=selected_client_id,
                 parent_id=new_parent_id,
                 parent_history=history,
                 promo_only=promo_only,
@@ -1961,7 +1842,7 @@ async def order_quantity_handler(message: Message, state: FSMContext) -> None:
     selected_product_id = str(data.get("selected_product_id", "")).strip()
     selected_unit = str(data.get("selected_unit", "")).strip()
     selected_price_per_unit = _to_float(data.get("selected_price_per_unit", 0), default=0.0)
-    selected_price_type_id = str(data.get("selected_price_type_id", "")).strip()
+    selected_client_id = str(data.get("selected_client_id", "")).strip()
     current_parent_id = data.get("product_parent_id")
     parent_id = current_parent_id if isinstance(current_parent_id, str) else None
     parent_history_raw = data.get("product_parent_history", [])
@@ -1969,7 +1850,7 @@ async def order_quantity_handler(message: Message, state: FSMContext) -> None:
     promo_only = bool(data.get("promo_only"))
     is_update = bool(data.get("updating_existing_item"))
 
-    if selected_price_per_unit <= 0 or not selected_price_type_id:
+    if selected_price_per_unit <= 0:
         await state.set_state(OrderStates.waiting_for_product)
         await state.update_data(
             selected_product=None,
@@ -2007,17 +1888,17 @@ async def order_quantity_handler(message: Message, state: FSMContext) -> None:
         await message.answer("⚠️ Не вдалося зберегти товар у кошик. Спробуйте ще раз.")
         return
 
-    if not selected_price_type_id:
-        await message.answer("⚠️ Не знайдено тип цін для каталогу. Поверніться до вибору договору.")
-        await state.set_state(OrderStates.waiting_for_contract)
-        await _send_contract_menu(message, state)
+    if not selected_client_id:
+        await message.answer("⚠️ Не знайдено клієнта для каталогу. Поверніться до вибору клієнта.")
+        await state.set_state(OrderStates.waiting_for_client)
+        await _send_client_menu(message, state)
         return
 
     try:
         await _fetch_and_set_product_scope(
             state,
             user_id=user_id,
-            price_type_id=selected_price_type_id,
+            client_id=selected_client_id,
             parent_id=parent_id,
             parent_history=parent_history,
             promo_only=promo_only,

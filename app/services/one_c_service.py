@@ -816,20 +816,21 @@ class OneCService:
     async def get_products(
         self,
         *,
-        price_type_id: str,
+        client_id: str,
         telegram_user_id: int,
         parent_id: str | None = None,
     ) -> list[Product]:
         if self.mock_mode:
+            mock_price_key = "demo-price-promo" if "promo" in client_id.casefold() else "demo-price-main"
             logger.info(
-                "Mock mode enabled: get_products user_id=%s price_type_id=%s parent_id=%s",
+                "Mock mode enabled: get_products user_id=%s client_id=%s parent_id=%s",
                 telegram_user_id,
-                price_type_id,
+                client_id,
                 parent_id,
             )
-            return self._mock_products(price_type_id, parent_id)
+            return self._mock_products(mock_price_key, parent_id)
 
-        params: dict[str, Any] = {"price_type_id": price_type_id}
+        params: dict[str, Any] = {"client_id": client_id}
         if parent_id:
             params["parent_id"] = parent_id
 
@@ -842,8 +843,9 @@ class OneCService:
             )
         except OneCServiceError as exc:
             if self._can_use_mock(exc):
+                mock_price_key = "demo-price-promo" if "promo" in client_id.casefold() else "demo-price-main"
                 logger.warning("1C unavailable in get_products, using mock mode: reason=%s", str(exc))
-                return self._mock_products(price_type_id, parent_id)
+                return self._mock_products(mock_price_key, parent_id)
             raise
 
         rows = self._extract_collection(
@@ -896,13 +898,10 @@ class OneCService:
 
     async def create_order(self, order_data: dict[str, Any], telegram_user_id: int) -> OrderResponse:
         client_id = str(order_data.get("client_id", "")).strip()
-        contract_id = str(order_data.get("contract_id", "")).strip()
         raw_products = order_data.get("products", order_data.get("items", []))
 
         if not client_id:
             raise OneCServiceError("Не вдалося сформувати замовлення: відсутній client_id.")
-        if not contract_id:
-            raise OneCServiceError("Не вдалося сформувати замовлення: відсутній contract_id.")
         if not isinstance(raw_products, list):
             raise OneCServiceError("Не вдалося сформувати замовлення: список товарів некоректний.")
 
@@ -937,7 +936,6 @@ class OneCService:
 
         payload = {
             "client_id": client_id,
-            "contract_id": contract_id,
             "products": products_payload,
         }
 
