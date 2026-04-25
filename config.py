@@ -30,11 +30,6 @@ class Settings(BaseSettings):
         validation_alias="ONE_C_X_BOT_TOKEN",
     )
     one_c_timeout: int = Field(default=10, validation_alias="ONE_C_TIMEOUT", ge=1)
-    mock_mode: bool = Field(default=False, validation_alias="MOCK_MODE")
-    mock_mode_on_1c_failure: bool = Field(
-        default=True,
-        validation_alias="MOCK_MODE_ON_1C_FAILURE",
-    )
     admin_ids: str = Field(default="", validation_alias="ADMIN_IDS")
     support_contact: str = Field(default="+380000000000", validation_alias="SUPPORT_CONTACT")
     database_url: str = Field(

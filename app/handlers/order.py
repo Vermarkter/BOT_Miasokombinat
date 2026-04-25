@@ -51,7 +51,6 @@ cart_repository = CartRepository()
 user_repository = UserRepository()
 
 FINISH_ORDER_BUTTON_TEXT = "✅ Оформити замовлення"
-LAST_ORDERS_BUTTON_TEXT = "🧾 Останні замовлення клієнта"
 BACK_BUTTON_TEXT = "⬅️ Назад"
 CONFIRM_ORDER_BUTTON_TEXT = "✅ Підтвердити"
 CANCEL_ORDER_BUTTON_TEXT = "❌ Скасувати"
@@ -95,7 +94,7 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 def _service_unavailable_message(error: OneCServiceError | None = None) -> str:
     if error is not None and str(error) == "Агента не знайдено в базі 1С":
         return "⚠️ Агента не знайдено в базі 1С"
-    return "⚠️ Сервіс 1С тимчасово недоступний. Ви можете продовжити в демо-режимі, якщо він увімкнений."
+    return "⚠️ Сервіс 1С тимчасово недоступний. Спробуйте трохи пізніше."
 
 
 def _cart_step(unit: str) -> float:
@@ -297,19 +296,6 @@ def _serialize_clients(rows: list[Any]) -> list[dict[str, Any]]:
     return result
 
 
-def _serialize_contracts(rows: list[Any]) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for row in rows:
-        result.append(
-            {
-                "id": str(row.id),
-                "name": str(row.name),
-                "price_type_id": str(row.price_type_id),
-            },
-        )
-    return result
-
-
 def _serialize_products(rows: list[Any]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for row in rows:
@@ -369,27 +355,6 @@ def _build_cart_inline_rows(cart: list[dict[str, Any]]) -> list[dict[str, str]]:
             },
         )
     return rows
-
-
-def _build_contract_prompt(
-    client_name: str,
-    client_debt: float | None,
-    client_limit: float | None,
-    *,
-    suffix: str = "Будь ласка, оберіть договір для замовлення:",
-) -> str:
-    lines = [f"Клієнт: <b>{client_name}</b>"]
-    if client_debt is None:
-        lines.append("💰 Поточний борг: <b>немає даних</b>")
-    else:
-        lines.append(f"💰 Поточний борг: <b>{_format_debt_money(client_debt)} грн</b>")
-    if client_limit is None:
-        lines.append("🏦 Кредитний ліміт: <b>немає даних</b>")
-    else:
-        lines.append(f"🏦 Кредитний ліміт: <b>{_format_debt_money(client_limit)} грн</b>")
-    if suffix.strip():
-        lines.append(suffix)
-    return "\n".join(lines)
 
 
 def _normalize_page(total_items: int, page: int, page_size: int = LIST_PAGE_SIZE) -> tuple[int, int]:
@@ -614,26 +579,6 @@ async def _update_cart_callback_message(callback: CallbackQuery, cart: list[dict
     )
 
 
-def _client_extra_buttons(data: dict[str, Any]) -> list[str]:
-    buttons: list[str] = []
-    history = data.get("client_parent_history")
-    if isinstance(history, list) and history:
-        buttons.append(BACK_BUTTON_TEXT)
-    buttons.append(SHOW_CART_BUTTON_TEXT)
-    return buttons
-
-
-def _contract_extra_buttons() -> list[str]:
-    return [LAST_ORDERS_BUTTON_TEXT, BACK_BUTTON_TEXT, SHOW_CART_BUTTON_TEXT]
-
-
-def _product_extra_buttons(cart: list[dict[str, Any]]) -> list[str]:
-    buttons = [BACK_BUTTON_TEXT, SHOW_CART_BUTTON_TEXT]
-    if cart:
-        buttons.insert(0, FINISH_ORDER_BUTTON_TEXT)
-    return buttons
-
-
 async def _send_client_menu(
     message: Message,
     state: FSMContext,
@@ -664,23 +609,6 @@ async def _send_client_menu(
         text=prompt,
         reply_markup=keyboard,
         edit=edit,
-    )
-
-
-async def _send_contract_menu(message: Message, state: FSMContext, *, text: str | None = None) -> None:
-    data = await state.get_data()
-    labels = data.get("contract_labels")
-    if not isinstance(labels, list):
-        labels = []
-    selected_client = str(data.get("selected_client", "-")).strip() or "-"
-    client_debt_raw = data.get("selected_client_debt")
-    client_limit_raw = data.get("selected_client_limit")
-    client_debt = _to_float(client_debt_raw, default=0.0) if client_debt_raw is not None else None
-    client_limit = _to_float(client_limit_raw, default=0.0) if client_limit_raw is not None else None
-    prompt = text or _build_contract_prompt(selected_client, client_debt, client_limit)
-    await message.answer(
-        prompt,
-        reply_markup=build_options_keyboard(labels, _contract_extra_buttons()),
     )
 
 
@@ -753,15 +681,6 @@ async def _set_client_scope(
     )
 
 
-async def _set_contract_scope(state: FSMContext, rows: list[dict[str, Any]]) -> None:
-    labels, label_map = _build_labeled_map(rows)
-    await state.update_data(
-        current_contracts=rows,
-        contract_labels=labels,
-        contract_label_map=label_map,
-    )
-
-
 async def _fetch_and_set_product_scope(
     state: FSMContext,
     *,
@@ -773,7 +692,7 @@ async def _fetch_and_set_product_scope(
 ) -> list[dict[str, Any]]:
     products = await one_c_service.get_products(
         client_id=client_id,
-        parent_id=parent_id,
+        parent_id=parent_id if parent_id is not None else "",
         telegram_user_id=user_id,
     )
     serialized = _serialize_products(products)
@@ -809,7 +728,7 @@ async def _open_products_for_selected_client(
             state,
             user_id=user_id,
             client_id=selected_client_id,
-            parent_id=None,
+            parent_id="",
             parent_history=[],
             promo_only=promo_only,
         )
