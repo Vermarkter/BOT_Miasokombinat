@@ -1580,12 +1580,12 @@ async def order_client_handler(message: Message, state: FSMContext) -> None:
     client_limit: float | None = None
 
     try:
-        client_finance = await one_c_service.get_debt(
+        debt_data = await one_c_service.get_debt(
             client_id=selected_client_id,
             telegram_user_id=user_id,
         )
-        client_debt = client_finance.debt
-        client_limit = client_finance.limit
+        client_debt = debt_data.debt
+        client_limit = debt_data.limit
     except OneCServiceError as exc:
         logger.warning(
             "Failed to fetch client finance, values will be shown as unavailable: user_id=%s client_id=%s error=%s",

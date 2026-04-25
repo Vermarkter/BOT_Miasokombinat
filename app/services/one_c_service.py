@@ -607,7 +607,7 @@ class OneCService:
     ) -> list[Product]:
         params: dict[str, Any] = {
             "client_id": client_id,
-            "parent_id": parent_id if parent_id is not None else "",
+            "parent_id": parent_id,
         }
         response = await self._request_json(
             "GET",
